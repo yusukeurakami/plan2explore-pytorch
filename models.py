@@ -88,6 +88,25 @@ class TransitionModel(jit.ScriptModule):
       hidden += [torch.stack(posterior_states[1:], dim=0), torch.stack(posterior_means[1:], dim=0), torch.stack(posterior_std_devs[1:], dim=0)]
     return hidden
 
+# class OneStepModel(jit.ScriptModule):
+#   def __init__(self, state_size, action_size, embedding_size, activateion_function='relu', model_width_factor=1):
+#     super().__init__()
+#     self.act_fn = getattr(F, activation_function)
+#     self.embedding_size = embedding_size
+#     self.hidden_size = embedding_size[0]*model_width_factor
+#     self.fc1 = nn.Linear(state_size + action_size, self.hidden_size)
+#     self.fc2 = nn.Linear(self.hidden_size + action_size, self.hidden_size)
+#     self.fc3 = nn.Linear(self.hidden_size + action_size, embedding_size)
+#     self.modules = [self.fc1, self.fc2, self.fc3]
+
+#   def __call__(self, prev_state, prev_action):
+#     prev_state = prev_state.detach()
+#     prev_action = prev_action.detach()
+#     hidden = self.act_fn(self.fc1(torch.cat([prev_state, prev_action], dim=1)))
+#     hidden = self.act_fn(self.fc2(hidden))
+#     mean = self.fc3(hidden)
+#     dist = torch.Deterministic(mean, torch.zeros_like(mean).to('cuda'))
+#     torch.distributions.Independent(dist, self.embedding_size)
 
 class SymbolicObservationModel(jit.ScriptModule):
   def __init__(self, observation_size, belief_size, state_size, embedding_size, activation_function='relu'):

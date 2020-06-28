@@ -17,8 +17,8 @@ from tensorboardX import SummaryWriter
 
 
 # Hyperparameters
-parser = argparse.ArgumentParser(description='PlaNet or Dreamer')
-parser.add_argument('--algo', type=str, default='planet', help='planet or dreamer')
+parser = argparse.ArgumentParser(description='PlaNet, Dreamer or plan2explore')
+parser.add_argument('--algo', type=str, default='p2e', help='planet, dreamer or p2e')
 parser.add_argument('--id', type=str, default='default', help='Experiment ID')
 parser.add_argument('--seed', type=int, default=1, metavar='S', help='Random seed')
 parser.add_argument('--disable-cuda', action='store_true', help='Disable CUDA')
@@ -119,6 +119,7 @@ reward_model = RewardModel(args.belief_size, args.state_size, args.hidden_size, 
 encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.cnn_activation_function).to(device=args.device)
 actor_model = ActorModel(args.belief_size, args.state_size, args.hidden_size, env.action_size, args.dense_activation_function).to(device=args.device)
 value_model = ValueModel(args.belief_size, args.state_size, args.hidden_size, args.dense_activation_function).to(device=args.device)
+onestep_model = OneStepModel(args.state_size, args.action_size, args.embedding_size, args.dense_activation_function).to(device=args.device)
 param_list = list(transition_model.parameters()) + list(observation_model.parameters()) + list(reward_model.parameters()) + list(encoder.parameters())
 value_actor_param_list = list(value_model.parameters()) + list(actor_model.parameters())
 params_list = param_list + value_actor_param_list
@@ -134,14 +135,13 @@ if args.models is not '' and os.path.exists(args.models):
   actor_model.load_state_dict(model_dicts['actor_model'])
   value_model.load_state_dict(model_dicts['value_model'])
   model_optimizer.load_state_dict(model_dicts['model_optimizer'])
-if args.algo=="dreamer":
+if args.algo=="dreamer" or args.algo=="p2e":
   print("DREAMER")
   planner = actor_model
 else:
   planner = MPCPlanner(env.action_size, args.planning_horizon, args.optimisation_iters, args.candidates, args.top_candidates, transition_model, reward_model)
 global_prior = Normal(torch.zeros(args.batch_size, args.state_size, device=args.device), torch.ones(args.batch_size, args.state_size, device=args.device))  # Global prior N(0, I)
 free_nats = torch.full((1, ), args.free_nats, device=args.device)  # Allowed deviation in KL divergence
-
 
 def update_belief_and_act(args, env, planner, transition_model, encoder, belief, posterior_state, action, observation, explore=False):
   # Infer belief over current state q(s_t|o≤t,a<t) from the history
@@ -200,6 +200,9 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     # print("rewards size: ",rewards[:-1].size()) # [49, 50] 
     # Create initial belief and state for time t = 0
     init_belief, init_state = torch.zeros(args.batch_size, args.belief_size, device=args.device), torch.zeros(args.batch_size, args.state_size, device=args.device)
+    
+    # onestep_dist = onestep_model(init_state, actions[:-1])
+
     # Update belief/state using posterior from previous belief/state, previous action and current observation (over entire sequence at once)
     #(49,50,200), (49,50,30), (49,50,30), (49,50,30), (49,50,30), (49,50,30), (49,50,30)
     beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = transition_model(init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:], )), nonterminals[:-1])

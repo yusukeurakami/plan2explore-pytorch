@@ -34,7 +34,7 @@ parser.add_argument('--belief-size', type=int, default=400, metavar='H', help='B
 parser.add_argument('--state-size', type=int, default=60, metavar='Z', help='State/latent size')
 parser.add_argument('--action-repeat', type=int, default=2, metavar='R', help='Action repeat')
 parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', help='Action noise')
-parser.add_argument('--episodes', type=int, default=1000, metavar='E', help='Total number of episodes')
+parser.add_argument('--episodes', type=int, default=2000, metavar='E', help='Total number of episodes')
 parser.add_argument('--seed-episodes', type=int, default=5, metavar='S', help='Seed episodes')
 parser.add_argument('--collect-interval', type=int, default=100, metavar='C', help='Collect interval')
 parser.add_argument('--batch-size', type=int, default=50, metavar='B', help='Batch size')
@@ -46,7 +46,7 @@ parser.add_argument('--overshooting-reward-scale', type=float, default=0, metava
 parser.add_argument('--global-kl-beta', type=float, default=0, metavar='βg', help='Global KL weight (0 to disable)')
 parser.add_argument('--free-nats', type=float, default=3, metavar='F', help='Free nats')
 parser.add_argument('--bit-depth', type=int, default=5, metavar='B', help='Image bit depth (quantisation)')
-parser.add_argument('--model_learning-rate', type=float, default=1e-3, metavar='α', help='Learning rate') 
+parser.add_argument('--model_learning-rate', type=float, default=6e-4, metavar='α', help='Learning rate') 
 parser.add_argument('--learning-rate-schedule', type=int, default=0, metavar='αS', help='Linear learning rate schedule (optimisation steps from 0 to final learning rate; 0 to disable)') 
 parser.add_argument('--adam-epsilon', type=float, default=1e-7, metavar='ε', help='Adam optimizer epsilon value') 
 # Note that original has a linear learning rate decay, but it seems unlikely that this makes a significant difference
@@ -430,7 +430,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     # print("using curious_planner for data collection")
     policy = curious_planner
   elif args.algo=="p2e" and not args.zero_shot:
-    if metrics['steps'][-1] > args.adaptation_step:
+    if metrics['steps'][-1]*args.action_repeat > args.adaptation_step:
       # print("after adaptation. using planner for data collection")
       policy = planner
     else:
@@ -465,14 +465,14 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     if args.algo=="planet" or args.algo=="dreamer":
       policy = planner
     elif args.algo=="p2e" and args.zero_shot:
-      # print("using planner for test")
+      print("using planner for test")
       policy = planner
     elif args.algo=="p2e" and not args.zero_shot:
-      if metrics['steps'][-1] > args.adaptation_step:
-        # print("after adaptation. using planner for test")
+      if metrics['steps'][-1]*args.action_repeat > args.adaptation_step:
+        print("after adaptation. using planner for test")
         policy = planner
       else:
-        # print("before adaptation. using curious_planner for test")
+        print("before adaptation. using curious_planner for test")
         policy = curious_planner
     # Set models to eval mode
     transition_model.eval()

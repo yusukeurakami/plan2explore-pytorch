@@ -8,6 +8,7 @@ import torch
 from torch.nn import functional as F
 from typing import Iterable
 from torch.nn import Module
+from models import bottle
 
 
 # Plots min, max and mean + standard deviation bars of a population over time
@@ -70,7 +71,8 @@ def imagine_ahead(prev_state, prev_belief, policy, transition_model, planning_ho
     hidden = transition_model.act_fn(transition_model.fc_embed_belief_prior(beliefs[t + 1]))
     prior_means[t + 1], _prior_std_dev = torch.chunk(transition_model.fc_state_prior(hidden), 2, dim=1)
     prior_std_devs[t + 1] = F.softplus(_prior_std_dev) + transition_model.min_std_dev
-    prior_states[t + 1] = prior_means[t + 1] + prior_std_devs[t + 1] * torch.randn_like(prior_means[t + 1])     
+    prior_states[t + 1] = prior_means[t + 1] + prior_std_devs[t + 1] * torch.randn_like(prior_means[t + 1])
+  actions[-1] = policy.get_action(beliefs[-1].detach(),prior_states[-1].detach())
   # Return new hidden states
   # imagined_traj = [beliefs, prior_states, prior_means, prior_std_devs]
   imagined_traj = [torch.stack(beliefs[1:], dim=0), torch.stack(prior_states[1:], dim=0), torch.stack(prior_means[1:], dim=0), torch.stack(prior_std_devs[1:], dim=0), torch.stack(actions[1:], dim=0)]
@@ -97,21 +99,21 @@ def lambda_return(imged_reward, value_pred, bootstrap, discount=0.99, lambda_=0.
   returns = outputs
   return returns
 
-def compute_curious_action_values(beliefs, states, actions, onestep_models):
+def compute_curious_action_values(beliefs, states, means, std_devs, actions, onestep_models, curious_actor_model, curious_value_model, discount):
   intrinsic_reward = compute_intrinsic_reward(beliefs, actions, onestep_models)
   reward = intrinsic_reward
-  reward -= self.compute_action_divergence(beliefs, states)
-  reward -= self.compute_state_divergence(states)
-  pcont = tf.ones_like(reward)
-  pcont *= self._c.discount
-  value = self._curious_value(beliefs, states).mode()
+  # reward -= compute_action_divergence(beliefs, states, curious_actor)
+  # reward -= compute_state_divergence(means, std_devs)
+  pcont = torch.ones_like(reward)
+  pcont *= discount
+  value = Normal(bottle(curious_value_model, (beliefs, states)),1).mean()
 
   reward = reward[:, :-1]
   value = value[:, :-1]
   pcont = pcont[:, :-1]
   bootstrap = value[:, -1]
 
-  return_ = tools.lambda_return(
+  return_ = lambda_return(
       reward, value, pcont, bootstrap,
       lambda_=self._c.disclam, axis=1)
 
@@ -121,16 +123,59 @@ def compute_curious_action_values(beliefs, states, actions, onestep_models):
   return return_
 
 def compute_intrinsic_reward(beliefs, actions, onestep_models):
-  pred_embeddings = []
+  pred_embeddings = [] #[torch.empty(0)] * len(onestep_models)
   for mdl in range(len(onestep_models)):
-      pred_embeddings.append(onestep_models[mdl](beliefs, actions).mean())
+      pred_embeddings.append(onestep_models[mdl](beliefs, actions).mean)
 
-  predictions = tf.convert_to_tensor(pred_embeddings)
-  mean, variance = tf.nn.moments(predictions, axes=[0])
-  reward, _ = tf.nn.moments(variance, axes=[2])
-
-  reward = tf.math.scalar_mul(self._c.intrinsic_reward_scale, reward)
+  predictions = torch.stack(pred_embeddings, dim=0)
+  var = torch.var(predictions,0)
+  reward = torch.mean(var,2)
+  intrinsic_reward_scale = 10000
+  reward *= intrinsic_reward_scale
   return reward
+
+# def compute_action_divergence(beliefs, states, curious_actor):
+#   pred = curious_actor(beliefs.detach(), states.detach())
+#   if not self._c.action_beta:
+#     return 0.0
+#   try:
+#     amount = -pred.entropy()
+#   except NotImplementedError:
+#     samples = pred.sample(100)
+#     amount = tf.reduce_mean(pred.log_prob(samples), 0)
+#   amount *= self._c.action_beta
+#   value = self._c.action_beta_dims_value
+#   if value and value < 0:
+#     amount /= value * float(pred.event_shape[-1].value)
+#   if value and value > 0:
+#     amount *= value * float(pred.event_shape[-1].value)
+#   # print("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< amount",amount)
+#   return amount
+
+# def compute_state_divergence(self, states):
+#   pred = self._dynamics.get_dist(states)
+#   if not self._c.state_beta:
+#     return 0.0
+#   try:
+#     amount = -pred.entropy()
+#   except NotImplementedError:
+#     samples = pred.sample(100)
+#     amount = tf.reduce_mean(pred.log_prob(samples), 0)
+#   amount *= self._c.state_beta
+#   return amount
+
+
+def compute_state_divergence(self, states):
+  pred = self._dynamics.get_dist(states)
+  if not self._c.state_beta:
+    return 0.0
+  try:
+    amount = -pred.entropy()
+  except NotImplementedError:
+    samples = pred.sample(100)
+    amount = tf.reduce_mean(pred.log_prob(samples), 0)
+  amount *= self._c.state_beta
+  return amount
 
 # "get_parameters" and "FreezeParameters" are from the following repo
 # https://github.com/juliusfrost/dreamer-pytorch

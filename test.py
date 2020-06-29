@@ -5,19 +5,28 @@ from torch.distributions.transformed_distribution import TransformedDistribution
 from torch.distributions.transforms import Transform, TanhTransform
 from torch.nn import functional as F
 
-onestep_num = 3
-bagging_size = 3
-a = torch.arange(0,54).view(3,3,6)
-b  = torch.Tensor(onestep_num, bagging_size).uniform_(0,bagging_size).type(torch.int64)
-batch_size = a.size(1)
-feature_size = a.size(2)
-print("action", a)
-print("indices", b)
-print("sample index",b[0,:])
-i = b[0,:].reshape(batch_size, 1, 1).expand(batch_size, batch_size, feature_size)
-print("sample index",i) #[1,3,6]
-c = torch.gather(a,0,i)
-print(c)
+# onestep_num = 3
+# bagging_size = 3
+# a = torch.arange(0,54).view(3,3,6)
+# b  = torch.Tensor(onestep_num, bagging_size).uniform_(0,bagging_size).type(torch.int64)
+# batch_size = a.size(1)
+# feature_size = a.size(2)
+# print("action", a)
+# print("indices", b)
+# print("sample index",b[0,:])
+# i = b[0,:].reshape(batch_size, 1, 1).expand(batch_size, batch_size, feature_size)
+# print("sample index",i) #[1,3,6]
+# c = torch.gather(a,0,i)
+# print(c)
+
+
+a = torch.arange(0,4*3*3*6).view(4,3,3,6).float()
+print("a",a, a.size())
+var = torch.var(a,0)
+print("var", var, var.size())
+reward = torch.mean(var,2)
+print("reward", reward, reward.size())
+
 
 # transition_model = torch.nn.Linear(20, 10)
 # value_model = torch.nn.Linear(10, 2)

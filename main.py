@@ -12,7 +12,7 @@ from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher
 from memory import ExperienceReplay
 from models import bottle, Encoder, ObservationModel, RewardModel, TransitionModel, ValueModel, ActorModel, OneStepModel
 from planner import MPCPlanner
-from utils import lineplot, write_video, imagine_ahead, lambda_return, compute_curious_action_values, FreezeParameters, ActivateParameters
+from utils import lineplot, write_video, imagine_ahead, lambda_return, compute_intrinsic_reward, FreezeParameters, ActivateParameters
 from tensorboardX import SummaryWriter
 
 
@@ -95,7 +95,8 @@ else:
   print("using CPU")
   args.device = torch.device('cpu')
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 
-           'observation_loss': [], 'reward_loss': [], 'kl_loss': [], 'actor_loss': [], 'value_loss': [], 'disagreement_loss': []}
+           'observation_loss': [], 'reward_loss': [], 'kl_loss': [], 'actor_loss': [], 'value_loss': [], 
+           'disagreement_loss': [], 'curious_actor_loss':[], 'curious_value_loss':[]}
 
 summary_name = results_dir + "/{}_{}_log"
 writer = SummaryWriter(summary_name.format(args.env, args.id))
@@ -135,6 +136,9 @@ if args.algo=="p2e":
   onestep_models = [OneStepModel(args.belief_size, env.action_size, args.embedding_size, args.dense_activation_function).to(device=args.device) for _ in range(args.onestep_num)]
   onestep_param_list = []
   for x in onestep_models: onestep_param_list += list(x.parameters())
+  onestep_modules = []
+  for x in onestep_models: onestep_modules += x.modules
+  # print("onestep modeuls",onestep_modules)
 #############################p2e end###################################
 param_list = list(transition_model.parameters()) + list(observation_model.parameters()) + list(reward_model.parameters()) + list(encoder.parameters())
 value_actor_param_list = list(value_model.parameters()) + list(actor_model.parameters())
@@ -163,11 +167,12 @@ if args.models is not '' and os.path.exists(args.models):
     curious_actor_model.load_state_dict(model_dicts['curious_actor_model'])
     curious_value_model.load_state_dict(model_dicts['curious_value_model'])
     onestep_optimizer.load_state_dict(model_dicts['onestep_optimizer'])
-if args.algo=="dreamer" or args.algo=="p2e":
+if args.algo=="dreamer":
   print("DREAMER")
   planner = actor_model
 if args.algo=="p2e":
   print("Plan2Explore") 
+  planner = actor_model
   curious_planner = curious_actor_model
 else:
   print("PlaNet")
@@ -233,18 +238,9 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     # print("rewards size: ",rewards[:-1].size()) # [49, 50] 
     # Create initial belief and state for time t = 0
     init_belief, init_state = torch.zeros(args.batch_size, args.belief_size, device=args.device), torch.zeros(args.batch_size, args.state_size, device=args.device)
-
     # Update belief/state using posterior from previous belief/state, previous action and current observation (over entire sequence at once)
     #(49,50,200), (49,50,30), (49,50,30), (49,50,30), (49,50,30), (49,50,30), (49,50,30)
     beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = transition_model(init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:], )), nonterminals[:-1])
-
-
-    # state =  Tensor("graph/transpose_4:0", shape=(2500, 15, 400), dtype=float32) 
-    # prev_action = Tensor("graph/transpose_5:0", shape=(2500, 15, 6), dtype=float32)
-    # print(posterior_states.size(),actions[:-1].size())
-    # onestep_dist = onestep_model(posterior_states, actions[:-1])
-
-
     # Calculate observation likelihood, reward likelihood and KL losses (for t = 0 only for latent overshooting); sum over final dims, average over batch and time (original implementation, though paper seems to miss 1/T scaling?)
     if args.worldmodel_MSEloss:
       observation_loss = F.mse_loss(bottle(observation_model, (beliefs, posterior_states)), observations[1:], reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
@@ -290,7 +286,42 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
     model_optimizer.step()
 
+    #Dreamer implementation: actor loss calculation and optimization    
+    # if args.algo=="dreamer" or args.algo=="p2e":
+    with torch.no_grad():
+      actor_states = posterior_states.detach()
+      actor_beliefs = beliefs.detach()
+    with FreezeParameters(model_modules):
+      imagination_traj = imagine_ahead(actor_states, actor_beliefs, actor_model, transition_model, args.planning_horizon)
+    imged_beliefs, imged_prior_states, imged_prior_means, imged_prior_std_devs, imged_actions = imagination_traj
+    with FreezeParameters(model_modules + value_model.modules):
+      imged_reward = bottle(reward_model, (imged_beliefs, imged_prior_states))
+      value_pred = bottle(value_model, (imged_beliefs, imged_prior_states))
+    returns = lambda_return(imged_reward, value_pred, bootstrap=value_pred[-1], discount=args.discount, lambda_=args.disclam)
+    actor_loss = -torch.mean(returns)
+    # Update model parameters
+    actor_optimizer.zero_grad()
+    actor_loss.backward()
+    nn.utils.clip_grad_norm_(actor_model.parameters(), args.grad_clip_norm, norm_type=2)
+    # print( [module.weight.grad for module in  actor_model.modules])
+    actor_optimizer.step()
+ 
+    #Dreamer implementation: value loss calculation and optimization
+    # if args.algo=="dreamer" or args.algo=="p2e":
+    with torch.no_grad():
+      value_beliefs = imged_beliefs.detach()
+      value_prior_states = imged_prior_states.detach()
+      target_return = returns.detach()
+    value_dist = Normal(bottle(value_model, (value_beliefs, value_prior_states)),1) # detach the input tensor from the transition network.
+    value_loss = -value_dist.log_prob(target_return).mean(dim=(0, 1)) 
+    # Update model parameters
+    value_optimizer.zero_grad()
+    value_loss.backward()
+    nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip_norm, norm_type=2)
+    value_optimizer.step()
+
     #Plan2explore implementation: onestep model loss calculation and optimization
+    # if args.algo=="p2e":
     with torch.no_grad():
       onestep_actions = actions.detach()
       onestep_obs = observations.detach()
@@ -327,68 +358,38 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       onestep_optimizer.step()
 
     #Plan2explore implementation: curious_actor model loss calculation and optimization
-    print("curious imagine run")
+    # if args.algo=="p2e":
     with torch.no_grad():
       actor_states = posterior_states.detach()
       actor_beliefs = beliefs.detach()
     with FreezeParameters(model_modules):
       curious_imagination_traj = imagine_ahead(actor_states, actor_beliefs, curious_actor_model, transition_model, args.planning_horizon)
     curious_imged_beliefs, curious_imged_prior_states, curious_imged_prior_means, curious_imged_prior_std_devs, curious_imged_actions = curious_imagination_traj
-    # curious_feat, curious_states, curious_actions = self._curious_imagine_ahead(post) 
-    print("curious imagine run done")
-    curious_actor_loss = compute_curious_action_values(curious_imged_beliefs,
-                                                       curious_imged_prior_states,
-                                                       curious_imged_prior_means,
-                                                       curious_imged_prior_std_devs,
-                                                       curious_imged_actions)
-    curious_actor_loss = -tf.reduce_mean(curious_actor_loss)
-    print("curious_actor_loss", curious_actor_loss)
+    with FreezeParameters(model_modules + value_model.modules + onestep_modules):
+      curious_reward = compute_intrinsic_reward(curious_imged_beliefs, curious_imged_actions, onestep_models)
+      curious_value_pred = bottle(value_model, (curious_imged_beliefs, curious_imged_prior_states))
+    curious_returns = lambda_return(curious_reward, curious_value_pred, bootstrap=curious_value_pred[-1], discount=args.discount, lambda_=args.disclam)
+    curious_actor_loss = -torch.mean(curious_returns)
+    # Update model parameters
+    curious_actor_optimizer.zero_grad()
+    curious_actor_loss.backward()
+    nn.utils.clip_grad_norm_(curious_actor_model.parameters(), args.grad_clip_norm, norm_type=2)
+    curious_actor_optimizer.step()
 
-    #Dreamer implementation: actor loss calculation and optimization    
-    # if args.algo=="dreamer" or args.algo=="p2e":
+    #Plan2explore implementation: curious_value model loss calculation and optimization
+    # if args.algo=="p2e":
     with torch.no_grad():
-      actor_states = posterior_states.detach()
-      actor_beliefs = beliefs.detach()
-    with FreezeParameters(model_modules):
-      imagination_traj = imagine_ahead(actor_states, actor_beliefs, actor_model, transition_model, args.planning_horizon)
-    #####################
-    # #test backprop
-    # flatten = lambda x: x.view([-1]+list(x.size()[2:]))
-    # with torch.no_grad(): # Delete the gradient from transition_model
-    # prev_belief = flatten(actor_beliefs)
-    # prev_state = flatten(actor_states)
-    # print(prev_belief.size())
-    # prev_belief = torch.ones(2450, 200).cuda()
-    # prev_state = torch.ones(2450, 30).cuda()
-    # actions = actor_model.get_action(prev_belief,prev_state)
-    # actor_loss = torch.mean(actions)
-    #####################
-    imged_beliefs, imged_prior_states, imged_prior_means, imged_prior_std_devs, imged_actions = imagination_traj
-    with FreezeParameters(model_modules + value_model.modules):
-      imged_reward = bottle(reward_model, (imged_beliefs, imged_prior_states))
-      value_pred = bottle(value_model, (imged_beliefs, imged_prior_states))
-    returns = lambda_return(imged_reward, value_pred, bootstrap=value_pred[-1], discount=args.discount, lambda_=args.disclam)
-    actor_loss = -torch.mean(returns)
+      curious_value_beliefs = curious_imged_beliefs.detach()
+      curious_value_prior_states = curious_imged_prior_states.detach()
+      curious_target_return = curious_returns.detach()
+    curious_value_dist = Normal(bottle(curious_value_model, (curious_value_beliefs, curious_value_prior_states)),1) # detach the input tensor from the transition network.
+    curious_value_loss = -curious_value_dist.log_prob(curious_target_return).mean(dim=(0, 1)) 
     # Update model parameters
-    actor_optimizer.zero_grad()
-    actor_loss.backward()
-    nn.utils.clip_grad_norm_(actor_model.parameters(), args.grad_clip_norm, norm_type=2)
-    # print( [module.weight.grad for module in  actor_model.modules])
-    actor_optimizer.step()
- 
-    #Dreamer implementation: value loss calculation and optimization
-    # if args.algo=="dreamer" or args.algo=="p2e":
-    with torch.no_grad():
-      value_beliefs = imged_beliefs.detach()
-      value_prior_states = imged_prior_states.detach()
-      target_return = returns.detach()
-    value_dist = Normal(bottle(value_model, (value_beliefs, value_prior_states)),1) # detach the input tensor from the transition network.
-    value_loss = -value_dist.log_prob(target_return).mean(dim=(0, 1)) 
-    # Update model parameters
-    value_optimizer.zero_grad()
-    value_loss.backward()
-    nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip_norm, norm_type=2)
-    value_optimizer.step()
+    curious_value_optimizer.zero_grad()
+    curious_value_loss.backward()
+    nn.utils.clip_grad_norm_(curious_value_model.parameters(), args.grad_clip_norm, norm_type=2)
+    curious_value_optimizer.step()
+
   
   # if args.algo=="planet":
   #   # Store (0) observation loss (1) reward loss (2) KL loss
@@ -397,8 +398,10 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   #   # Store (0) observation loss (1) reward loss (2) KL loss (3) actor loss (4) value loss
   #   losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item(), actor_loss.item(), value_loss.item()])
   # if args.algo=="p2e":
-  #   # Store (0) observation loss (1) reward loss (2) KL loss (3) actor loss (4) value loss (5) disagreement loss
-  losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item(), actor_loss.item(), value_loss.item(), disagreement_loss.item()])
+  #   # Store (0) observation loss (1) reward loss (2) KL loss (3) actor loss (4) value loss 
+            # (5) disagreement loss (6) curious_actor_loss (7) curious_value_loss
+  losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item(), actor_loss.item(), value_loss.item(),
+                  disagreement_loss.item(), curious_actor_loss.item(), curious_value_loss.item()])
 
 
   # Update and plot loss metrics
@@ -409,12 +412,16 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   metrics['actor_loss'].append(losses[3])
   metrics['value_loss'].append(losses[4])
   metrics['disagreement_loss'].append(losses[5])
+  metrics['curious_actor_loss'].append(losses[6])
+  metrics['curious_value_loss'].append(losses[7])
   lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['kl_loss']):], metrics['kl_loss'], 'kl_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['actor_loss']):], metrics['actor_loss'], 'actor_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['disagreement_loss']):], metrics['disagreement_loss'], 'disagreement_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['curious_actor_loss']):], metrics['curious_actor_loss'], 'curious_actor_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['curious_value_loss']):], metrics['curious_value_loss'], 'curious_value_loss', results_dir)
 
 
   # Data collection
@@ -498,6 +505,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   writer.add_scalar("actor_loss", metrics['actor_loss'][0][-1], metrics['steps'][-1])
   writer.add_scalar("value_loss", metrics['value_loss'][0][-1], metrics['steps'][-1])
   writer.add_scalar("disagreement_loss", metrics['disagreement_loss'][0][-1], metrics['steps'][-1]) 
+  writer.add_scalar("curious_actor_loss", metrics['curious_actor_loss'][0][-1], metrics['steps'][-1]) 
+  writer.add_scalar("curious_value_loss", metrics['curious_value_loss'][0][-1], metrics['steps'][-1]) 
   print("episodes: {}, total_steps: {}, train_reward: {} ".format(metrics['episodes'][-1], metrics['steps'][-1], metrics['train_rewards'][-1]))
 
   # Checkpoint models
@@ -510,7 +519,9 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
                 'value_model': value_model.state_dict(),
                 'model_optimizer': model_optimizer.state_dict(),
                 'actor_optimizer': actor_optimizer.state_dict(),
-                'value_optimizer': value_optimizer.state_dict()
+                'value_optimizer': value_optimizer.state_dict(),
+                'curious_actor_optimizer': curious_actor_optimizer.state_dict(),
+                'curious_value_optimizer': curious_value_optimizer.state_dict()
                 }, os.path.join(results_dir, 'models_%d.pth' % episode))
     if args.checkpoint_experience:
       torch.save(D, os.path.join(results_dir, 'experience.pth'))  # Warning: will fail with MemoryError with large memory sizes
@@ -535,3 +546,16 @@ env.close()
 # model_optimizer.step()
 # actor_optimizer.step()
 # value_optimizer.step()
+
+#####################
+# #test backprop
+# flatten = lambda x: x.view([-1]+list(x.size()[2:]))
+# with torch.no_grad(): # Delete the gradient from transition_model
+# prev_belief = flatten(actor_beliefs)
+# prev_state = flatten(actor_states)
+# print(prev_belief.size())
+# prev_belief = torch.ones(2450, 200).cuda()
+# prev_state = torch.ones(2450, 30).cuda()
+# actions = actor_model.get_action(prev_belief,prev_state)
+# actor_loss = torch.mean(actions)
+#####################

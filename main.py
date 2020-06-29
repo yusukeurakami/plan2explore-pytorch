@@ -65,7 +65,7 @@ parser.add_argument('--ensemble_loss_scale', type=float, default=1.0, metavar='H
 parser.add_argument('--disagreement_learning-rate', type=float, default=8e-5, metavar='α', help='Learning rate') 
 parser.add_argument('--onestep-activation-function', type=str, default='relu', choices=dir(F), help='Model activation function a for a onestep dense layer')
 parser.add_argument('--adaptation-step', type=int, default=1_000_000, metavar='H', help='number of step to train the actor with real task reward')
-parser.add_argument('--zero-shot', action='store_false', help='use the normal actor for every test. If False, it uses curious_actor until adaptation_step')
+parser.add_argument('--zero-shot', action='store_true', help='use the normal actor for every test. If False, it uses curious_actor until adaptation_step')
 #Dreamer parameters
 parser.add_argument('--actor_learning-rate', type=float, default=8e-5, metavar='α', help='Learning rate') 
 parser.add_argument('--value_learning-rate', type=float, default=8e-5, metavar='α', help='Learning rate') 
@@ -131,7 +131,6 @@ encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, 
 if args.algo=="dreamer" or args.algo=="p2e":
   actor_model = ActorModel(args.belief_size, args.state_size, args.hidden_size, env.action_size, args.dense_activation_function).to(device=args.device)
   value_model = ValueModel(args.belief_size, args.state_size, args.hidden_size, args.dense_activation_function).to(device=args.device)
-#############################p2e begin###################################
 if args.algo=="p2e":
   curious_actor_model = ActorModel(args.belief_size, args.state_size, args.hidden_size, env.action_size, args.dense_activation_function).to(device=args.device)
   curious_value_model = ValueModel(args.belief_size, args.state_size, args.hidden_size, args.dense_activation_function).to(device=args.device)
@@ -140,8 +139,6 @@ if args.algo=="p2e":
   for x in onestep_models: onestep_param_list += list(x.parameters())
   onestep_modules = []
   for x in onestep_models: onestep_modules += x.modules
-  # print("onestep modeuls",onestep_modules)
-#############################p2e end###################################
 param_list = list(transition_model.parameters()) + list(observation_model.parameters()) + list(reward_model.parameters()) + list(encoder.parameters())
 value_actor_param_list = list(value_model.parameters()) + list(actor_model.parameters())
 params_list = param_list + value_actor_param_list
@@ -149,12 +146,10 @@ model_optimizer = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 
 if args.algo=="dreamer" or args.algo=="p2e":
   actor_optimizer = optim.Adam(actor_model.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.actor_learning_rate, eps=args.adam_epsilon)
   value_optimizer = optim.Adam(value_model.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.value_learning_rate, eps=args.adam_epsilon)
-#############################p2e begin###################################
 if args.algo=="p2e":
   curious_actor_optimizer = optim.Adam(actor_model.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.actor_learning_rate, eps=args.adam_epsilon)
   curious_value_optimizer = optim.Adam(value_model.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.value_learning_rate, eps=args.adam_epsilon)
   onestep_optimizer = optim.Adam(onestep_param_list, lr=0 if args.learning_rate_schedule != 0 else args.disagreement_learning_rate, eps=args.adam_epsilon)
-#############################p2e end###################################
 if args.models is not '' and os.path.exists(args.models):
   model_dicts = torch.load(args.models)
   transition_model.load_state_dict(model_dicts['transition_model'])
@@ -432,11 +427,14 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   if args.algo=="planet" or args.algo=="dreamer":
     policy = planner
   elif args.algo=="p2e" and args.zero_shot:
+    # print("using curious_planner for data collection")
     policy = curious_planner
   elif args.algo=="p2e" and not args.zero_shot:
     if metrics['steps'][-1] > args.adaptation_step:
+      # print("after adaptation. using planner for data collection")
       policy = planner
     else:
+      # print("before adaptation. using curious_planner for data collection")
       policy = curious_planner
   with torch.no_grad():
     observation, total_reward = env.reset(), 0
@@ -467,11 +465,14 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     if args.algo=="planet" or args.algo=="dreamer":
       policy = planner
     elif args.algo=="p2e" and args.zero_shot:
+      # print("using planner for test")
       policy = planner
     elif args.algo=="p2e" and not args.zero_shot:
       if metrics['steps'][-1] > args.adaptation_step:
+        # print("after adaptation. using planner for test")
         policy = planner
       else:
+        # print("before adaptation. using curious_planner for test")
         policy = curious_planner
     # Set models to eval mode
     transition_model.eval()

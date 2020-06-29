@@ -52,18 +52,20 @@ parser.add_argument('--adam-epsilon', type=float, default=1e-7, metavar='ε', he
 # Note that original has a linear learning rate decay, but it seems unlikely that this makes a significant difference
 parser.add_argument('--grad-clip-norm', type=float, default=100.0, metavar='C', help='Gradient clipping norm')
 parser.add_argument('--test', action='store_true', help='Test only')
-parser.add_argument('--test-interval', type=int, default=25, metavar='I', help='Test interval (episodes)')
+parser.add_argument('--test-interval', type=int, default=10, metavar='I', help='Test interval (episodes)')
 parser.add_argument('--test-episodes', type=int, default=10, metavar='E', help='Number of test episodes')
 parser.add_argument('--checkpoint-interval', type=int, default=50, metavar='I', help='Checkpoint interval (episodes)')
 parser.add_argument('--checkpoint-experience', action='store_true', help='Checkpoint experience replay')
 parser.add_argument('--models', type=str, default='', metavar='M', help='Load model checkpoint')
 parser.add_argument('--experience-replay', type=str, default='', metavar='ER', help='Load experience replay')
 parser.add_argument('--render', action='store_true', help='Render environment')
-
 #Plan2Explore parameters
 parser.add_argument('--onestep-num', type=int, default=5, metavar='H', help='numbers of onestep models')
 parser.add_argument('--ensemble_loss_scale', type=float, default=1.0, metavar='H', help='weight for the ensemble loss')
 parser.add_argument('--disagreement_learning-rate', type=float, default=8e-5, metavar='α', help='Learning rate') 
+parser.add_argument('--onestep-activation-function', type=str, default='relu', choices=dir(F), help='Model activation function a for a onestep dense layer')
+parser.add_argument('--adaptation-step', type=int, default=1_000_000, metavar='H', help='number of step to train the actor with real task reward')
+parser.add_argument('--zero-shot', action='store_false', help='use the normal actor for every test. If False, it uses curious_actor until adaptation_step')
 #Dreamer parameters
 parser.add_argument('--actor_learning-rate', type=float, default=8e-5, metavar='α', help='Learning rate') 
 parser.add_argument('--value_learning-rate', type=float, default=8e-5, metavar='α', help='Learning rate') 
@@ -133,7 +135,7 @@ if args.algo=="dreamer" or args.algo=="p2e":
 if args.algo=="p2e":
   curious_actor_model = ActorModel(args.belief_size, args.state_size, args.hidden_size, env.action_size, args.dense_activation_function).to(device=args.device)
   curious_value_model = ValueModel(args.belief_size, args.state_size, args.hidden_size, args.dense_activation_function).to(device=args.device)
-  onestep_models = [OneStepModel(args.belief_size, env.action_size, args.embedding_size, args.dense_activation_function).to(device=args.device) for _ in range(args.onestep_num)]
+  onestep_models = [OneStepModel(args.belief_size, env.action_size, args.embedding_size, args.onestep_activation_function).to(device=args.device) for _ in range(args.onestep_num)]
   onestep_param_list = []
   for x in onestep_models: onestep_param_list += list(x.parameters())
   onestep_modules = []
@@ -200,6 +202,7 @@ def update_belief_and_act(args, env, planner, transition_model, encoder, belief,
 # Testing only
 if args.test:
   # Set models to eval mode
+  # uses normal actor for testing only case
   transition_model.eval()
   reward_model.eval()
   encoder.eval()
@@ -426,13 +429,22 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
 
   # Data collection
   print("Data collection")
+  if args.algo=="planet" or args.algo=="dreamer":
+    policy = planner
+  elif args.algo=="p2e" and args.zero_shot:
+    policy = curious_planner
+  elif args.algo=="p2e" and not args.zero_shot:
+    if metrics['steps'][-1] > args.adaptation_step:
+      policy = planner
+    else:
+      policy = curious_planner
   with torch.no_grad():
     observation, total_reward = env.reset(), 0
     belief, posterior_state, action = torch.zeros(1, args.belief_size, device=args.device), torch.zeros(1, args.state_size, device=args.device), torch.zeros(1, env.action_size, device=args.device)
     pbar = tqdm(range(args.max_episode_length // args.action_repeat))
     for t in pbar:
       # print("step",t)
-      belief, posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, transition_model, encoder, belief, posterior_state, action, observation.to(device=args.device), explore=True)
+      belief, posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, policy, transition_model, encoder, belief, posterior_state, action, observation.to(device=args.device), explore=True)
       D.append(observation, action.cpu(), reward, done)
       total_reward += reward
       observation = next_observation
@@ -452,6 +464,15 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   # Test model
   print("Test model")
   if episode % args.test_interval == 0:
+    if args.algo=="planet" or args.algo=="dreamer":
+      policy = planner
+    elif args.algo=="p2e" and args.zero_shot:
+      policy = planner
+    elif args.algo=="p2e" and not args.zero_shot:
+      if metrics['steps'][-1] > args.adaptation_step:
+        policy = planner
+      else:
+        policy = curious_planner
     # Set models to eval mode
     transition_model.eval()
     observation_model.eval()
@@ -467,7 +488,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       belief, posterior_state, action = torch.zeros(args.test_episodes, args.belief_size, device=args.device), torch.zeros(args.test_episodes, args.state_size, device=args.device), torch.zeros(args.test_episodes, env.action_size, device=args.device)
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
-        belief, posterior_state, action, next_observation, reward, done = update_belief_and_act(args, test_envs, planner, transition_model, encoder, belief, posterior_state, action, observation.to(device=args.device))
+        belief, posterior_state, action, next_observation, reward, done = update_belief_and_act(args, test_envs, policy, transition_model, encoder, belief, posterior_state, action, observation.to(device=args.device))
         total_rewards += reward.numpy()
         if not args.symbolic_env:  # Collect real vs. predicted frames for video
           video_frames.append(make_grid(torch.cat([observation, observation_model(belief, posterior_state).cpu()], dim=3) + 0.5, nrow=5).numpy())  # Decentre
@@ -486,6 +507,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       write_video(video_frames, 'test_episode_%s' % episode_str, results_dir)  # Lossy compression
       save_image(torch.as_tensor(video_frames[-1]), os.path.join(results_dir, 'test_episode_%s.png' % episode_str))
     torch.save(metrics, os.path.join(results_dir, 'metrics.pth'))
+    test_reward_sum = sum(metrics['test_rewards'][-1])
+    writer.add_scalar("test/episode_reward", test_reward_sum/args.test_episodes, metrics['steps'][-1]*args.action_repeat)
 
     # Set models to train mode
     transition_model.train()

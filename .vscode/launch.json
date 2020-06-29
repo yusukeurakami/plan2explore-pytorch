@@ -12,7 +12,7 @@
             "console": "integratedTerminal",
             "args": ["--env", "walker-walk", "--id" "benchmark",
                  "--action-repeat", "2", "--collect-interval", "2",
-                 "--algo", "p2e", "--batch-size", "50", "--chunk-size", "50", "--onestep-num", "5", "--experience-size", "100000"],
+                 "--algo", "p2e", "--batch-size", "50", "--chunk-size", "50", "--onestep-num", "1", "--experience-size", "100000", "--zero-shot", "--test-interval", "1"],
         }
     ]
 }

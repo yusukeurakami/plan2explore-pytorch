@@ -10,9 +10,9 @@ from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher
 from memory import ExperienceReplay
-from models import bottle, Encoder, ObservationModel, RewardModel, TransitionModel, ValueModel, ActorModel
+from models import bottle, Encoder, ObservationModel, RewardModel, TransitionModel, ValueModel, ActorModel, OneStepModel
 from planner import MPCPlanner
-from utils import lineplot, write_video, imagine_ahead, lambda_return, FreezeParameters, ActivateParameters
+from utils import lineplot, write_video, imagine_ahead, lambda_return, compute_curious_action_values, FreezeParameters, ActivateParameters
 from tensorboardX import SummaryWriter
 
 
@@ -29,9 +29,9 @@ parser.add_argument('--experience-size', type=int, default=1000000, metavar='D',
 parser.add_argument('--cnn-activation-function', type=str, default='relu', choices=dir(F), help='Model activation function for a convolution layer')
 parser.add_argument('--dense-activation-function', type=str, default='elu', choices=dir(F), help='Model activation function a dense layer')
 parser.add_argument('--embedding-size', type=int, default=1024, metavar='E', help='Observation embedding size')  # Note that the default encoder for visual observations outputs a 1024D vector; for other embedding sizes an additional fully-connected layer is used
-parser.add_argument('--hidden-size', type=int, default=200, metavar='H', help='Hidden size')
-parser.add_argument('--belief-size', type=int, default=200, metavar='H', help='Belief/hidden size')
-parser.add_argument('--state-size', type=int, default=30, metavar='Z', help='State/latent size')
+parser.add_argument('--hidden-size', type=int, default=400, metavar='H', help='Hidden size')
+parser.add_argument('--belief-size', type=int, default=400, metavar='H', help='Belief/hidden size')
+parser.add_argument('--state-size', type=int, default=60, metavar='Z', help='State/latent size')
 parser.add_argument('--action-repeat', type=int, default=2, metavar='R', help='Action repeat')
 parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', help='Action noise')
 parser.add_argument('--episodes', type=int, default=1000, metavar='E', help='Total number of episodes')
@@ -47,18 +47,10 @@ parser.add_argument('--global-kl-beta', type=float, default=0, metavar='βg', he
 parser.add_argument('--free-nats', type=float, default=3, metavar='F', help='Free nats')
 parser.add_argument('--bit-depth', type=int, default=5, metavar='B', help='Image bit depth (quantisation)')
 parser.add_argument('--model_learning-rate', type=float, default=1e-3, metavar='α', help='Learning rate') 
-parser.add_argument('--actor_learning-rate', type=float, default=8e-5, metavar='α', help='Learning rate') 
-parser.add_argument('--value_learning-rate', type=float, default=8e-5, metavar='α', help='Learning rate') 
 parser.add_argument('--learning-rate-schedule', type=int, default=0, metavar='αS', help='Linear learning rate schedule (optimisation steps from 0 to final learning rate; 0 to disable)') 
 parser.add_argument('--adam-epsilon', type=float, default=1e-7, metavar='ε', help='Adam optimizer epsilon value') 
 # Note that original has a linear learning rate decay, but it seems unlikely that this makes a significant difference
 parser.add_argument('--grad-clip-norm', type=float, default=100.0, metavar='C', help='Gradient clipping norm')
-parser.add_argument('--planning-horizon', type=int, default=15, metavar='H', help='Planning horizon distance')
-parser.add_argument('--discount', type=float, default=0.99, metavar='H', help='Planning horizon distance')
-parser.add_argument('--disclam', type=float, default=0.95, metavar='H', help='discount rate to compute return')
-parser.add_argument('--optimisation-iters', type=int, default=10, metavar='I', help='Planning optimisation iterations')
-parser.add_argument('--candidates', type=int, default=1000, metavar='J', help='Candidate samples per iteration')
-parser.add_argument('--top-candidates', type=int, default=100, metavar='K', help='Number of top candidates to fit')
 parser.add_argument('--test', action='store_true', help='Test only')
 parser.add_argument('--test-interval', type=int, default=25, metavar='I', help='Test interval (episodes)')
 parser.add_argument('--test-episodes', type=int, default=10, metavar='E', help='Number of test episodes')
@@ -67,6 +59,22 @@ parser.add_argument('--checkpoint-experience', action='store_true', help='Checkp
 parser.add_argument('--models', type=str, default='', metavar='M', help='Load model checkpoint')
 parser.add_argument('--experience-replay', type=str, default='', metavar='ER', help='Load experience replay')
 parser.add_argument('--render', action='store_true', help='Render environment')
+
+#Plan2Explore parameters
+parser.add_argument('--onestep-num', type=int, default=5, metavar='H', help='numbers of onestep models')
+parser.add_argument('--ensemble_loss_scale', type=float, default=1.0, metavar='H', help='weight for the ensemble loss')
+parser.add_argument('--disagreement_learning-rate', type=float, default=8e-5, metavar='α', help='Learning rate') 
+#Dreamer parameters
+parser.add_argument('--actor_learning-rate', type=float, default=8e-5, metavar='α', help='Learning rate') 
+parser.add_argument('--value_learning-rate', type=float, default=8e-5, metavar='α', help='Learning rate') 
+parser.add_argument('--planning-horizon', type=int, default=15, metavar='H', help='Planning horizon distance')
+parser.add_argument('--discount', type=float, default=0.99, metavar='H', help='Planning horizon distance')
+parser.add_argument('--disclam', type=float, default=0.95, metavar='H', help='discount rate to compute return')
+#Planet parameters
+parser.add_argument('--optimisation-iters', type=int, default=10, metavar='I', help='Planning optimisation iterations')
+parser.add_argument('--candidates', type=int, default=1000, metavar='J', help='Candidate samples per iteration')
+parser.add_argument('--top-candidates', type=int, default=100, metavar='K', help='Number of top candidates to fit')
+
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
 print(' ' * 26 + 'Options')
@@ -87,7 +95,7 @@ else:
   print("using CPU")
   args.device = torch.device('cpu')
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 
-           'observation_loss': [], 'reward_loss': [], 'kl_loss': [], 'actor_loss': [], 'value_loss': []}
+           'observation_loss': [], 'reward_loss': [], 'kl_loss': [], 'actor_loss': [], 'value_loss': [], 'disagreement_loss': []}
 
 summary_name = results_dir + "/{}_{}_log"
 writer = SummaryWriter(summary_name.format(args.env, args.id))
@@ -117,28 +125,52 @@ transition_model = TransitionModel(args.belief_size, args.state_size, env.action
 observation_model = ObservationModel(args.symbolic_env, env.observation_size, args.belief_size, args.state_size, args.embedding_size, args.cnn_activation_function).to(device=args.device)
 reward_model = RewardModel(args.belief_size, args.state_size, args.hidden_size, args.dense_activation_function).to(device=args.device)
 encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.cnn_activation_function).to(device=args.device)
-actor_model = ActorModel(args.belief_size, args.state_size, args.hidden_size, env.action_size, args.dense_activation_function).to(device=args.device)
-value_model = ValueModel(args.belief_size, args.state_size, args.hidden_size, args.dense_activation_function).to(device=args.device)
-onestep_model = OneStepModel(args.state_size, args.action_size, args.embedding_size, args.dense_activation_function).to(device=args.device)
+if args.algo=="dreamer" or args.algo=="p2e":
+  actor_model = ActorModel(args.belief_size, args.state_size, args.hidden_size, env.action_size, args.dense_activation_function).to(device=args.device)
+  value_model = ValueModel(args.belief_size, args.state_size, args.hidden_size, args.dense_activation_function).to(device=args.device)
+#############################p2e begin###################################
+if args.algo=="p2e":
+  curious_actor_model = ActorModel(args.belief_size, args.state_size, args.hidden_size, env.action_size, args.dense_activation_function).to(device=args.device)
+  curious_value_model = ValueModel(args.belief_size, args.state_size, args.hidden_size, args.dense_activation_function).to(device=args.device)
+  onestep_models = [OneStepModel(args.belief_size, env.action_size, args.embedding_size, args.dense_activation_function).to(device=args.device) for _ in range(args.onestep_num)]
+  onestep_param_list = []
+  for x in onestep_models: onestep_param_list += list(x.parameters())
+#############################p2e end###################################
 param_list = list(transition_model.parameters()) + list(observation_model.parameters()) + list(reward_model.parameters()) + list(encoder.parameters())
 value_actor_param_list = list(value_model.parameters()) + list(actor_model.parameters())
 params_list = param_list + value_actor_param_list
 model_optimizer = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.model_learning_rate, eps=args.adam_epsilon)
-actor_optimizer = optim.Adam(actor_model.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.actor_learning_rate, eps=args.adam_epsilon)
-value_optimizer = optim.Adam(value_model.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.value_learning_rate, eps=args.adam_epsilon)
+if args.algo=="dreamer" or args.algo=="p2e":
+  actor_optimizer = optim.Adam(actor_model.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.actor_learning_rate, eps=args.adam_epsilon)
+  value_optimizer = optim.Adam(value_model.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.value_learning_rate, eps=args.adam_epsilon)
+#############################p2e begin###################################
+if args.algo=="p2e":
+  curious_actor_optimizer = optim.Adam(actor_model.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.actor_learning_rate, eps=args.adam_epsilon)
+  curious_value_optimizer = optim.Adam(value_model.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.value_learning_rate, eps=args.adam_epsilon)
+  onestep_optimizer = optim.Adam(onestep_param_list, lr=0 if args.learning_rate_schedule != 0 else args.disagreement_learning_rate, eps=args.adam_epsilon)
+#############################p2e end###################################
 if args.models is not '' and os.path.exists(args.models):
   model_dicts = torch.load(args.models)
   transition_model.load_state_dict(model_dicts['transition_model'])
   observation_model.load_state_dict(model_dicts['observation_model'])
   reward_model.load_state_dict(model_dicts['reward_model'])
   encoder.load_state_dict(model_dicts['encoder'])
-  actor_model.load_state_dict(model_dicts['actor_model'])
-  value_model.load_state_dict(model_dicts['value_model'])
   model_optimizer.load_state_dict(model_dicts['model_optimizer'])
+  if args.algo=="dreamer" or args.algo=="p2e":
+    actor_model.load_state_dict(model_dicts['actor_model'])
+    value_model.load_state_dict(model_dicts['value_model'])
+  if args.algo=="p2e":
+    curious_actor_model.load_state_dict(model_dicts['curious_actor_model'])
+    curious_value_model.load_state_dict(model_dicts['curious_value_model'])
+    onestep_optimizer.load_state_dict(model_dicts['onestep_optimizer'])
 if args.algo=="dreamer" or args.algo=="p2e":
   print("DREAMER")
   planner = actor_model
+if args.algo=="p2e":
+  print("Plan2Explore") 
+  curious_planner = curious_actor_model
 else:
+  print("PlaNet")
   planner = MPCPlanner(env.action_size, args.planning_horizon, args.optimisation_iters, args.candidates, args.top_candidates, transition_model, reward_model)
 global_prior = Normal(torch.zeros(args.batch_size, args.state_size, device=args.device), torch.ones(args.batch_size, args.state_size, device=args.device))  # Global prior N(0, I)
 free_nats = torch.full((1, ), args.free_nats, device=args.device)  # Allowed deviation in KL divergence
@@ -148,7 +180,8 @@ def update_belief_and_act(args, env, planner, transition_model, encoder, belief,
   # print("action size: ",action.size()) torch.Size([1, 6])
   belief, _, _, _, posterior_state, _, _ = transition_model(posterior_state, action.unsqueeze(dim=0), belief, encoder(observation).unsqueeze(dim=0))  # Action and observation need extra time dimension
   belief, posterior_state = belief.squeeze(dim=0), posterior_state.squeeze(dim=0)  # Remove time dimension from belief/state
-  if args.algo=="dreamer":
+  if args.algo=="dreamer" or args.algo=="p2e":
+    # action = planner.get_action(belief, posterior_state, det=True)
     action = planner.get_action(belief, posterior_state, det=not(explore))
   else:
     action = planner(belief, posterior_state)  # Get action from planner(q(s_t|o≤t,a<t), p)
@@ -200,12 +233,18 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     # print("rewards size: ",rewards[:-1].size()) # [49, 50] 
     # Create initial belief and state for time t = 0
     init_belief, init_state = torch.zeros(args.batch_size, args.belief_size, device=args.device), torch.zeros(args.batch_size, args.state_size, device=args.device)
-    
-    # onestep_dist = onestep_model(init_state, actions[:-1])
 
     # Update belief/state using posterior from previous belief/state, previous action and current observation (over entire sequence at once)
     #(49,50,200), (49,50,30), (49,50,30), (49,50,30), (49,50,30), (49,50,30), (49,50,30)
     beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = transition_model(init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:], )), nonterminals[:-1])
+
+
+    # state =  Tensor("graph/transpose_4:0", shape=(2500, 15, 400), dtype=float32) 
+    # prev_action = Tensor("graph/transpose_5:0", shape=(2500, 15, 6), dtype=float32)
+    # print(posterior_states.size(),actions[:-1].size())
+    # onestep_dist = onestep_model(posterior_states, actions[:-1])
+
+
     # Calculate observation likelihood, reward likelihood and KL losses (for t = 0 only for latent overshooting); sum over final dims, average over batch and time (original implementation, though paper seems to miss 1/T scaling?)
     if args.worldmodel_MSEloss:
       observation_loss = F.mse_loss(bottle(observation_model, (beliefs, posterior_states)), observations[1:], reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
@@ -251,7 +290,62 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
     model_optimizer.step()
 
+    #Plan2explore implementation: onestep model loss calculation and optimization
+    with torch.no_grad():
+      onestep_actions = actions.detach()
+      onestep_obs = observations.detach()
+      onestep_beliefs = beliefs.detach()
+    onestep_batch_size = onestep_actions.size(1)
+    action_feature_size = onestep_actions.size(2)
+    obs_feature_size = args.embedding_size
+    belief_feature_size = onestep_beliefs.size(2)
+    with FreezeParameters(model_modules):
+      onestep_embed = bottle(encoder, (onestep_obs, ))
+    bagging_size = args.batch_size
+    sample_with_replacement = torch.Tensor(args.onestep_num, bagging_size).uniform_(0,args.batch_size).type(torch.int64).to(device=args.device)
+    # losses = []
+    for mdl in range(len(onestep_models)):
+      action_indices = sample_with_replacement[mdl,:].reshape(onestep_batch_size, 1, 1).expand(onestep_batch_size, onestep_batch_size, action_feature_size)
+      pred_indices = sample_with_replacement[mdl,:].reshape(onestep_batch_size, 1, 1).expand(onestep_batch_size, onestep_batch_size, obs_feature_size)
+      belief_indices = sample_with_replacement[mdl,:].reshape(onestep_batch_size, 1, 1).expand(onestep_batch_size, onestep_batch_size, belief_feature_size)
+      input_action = torch.gather(onestep_actions, 0, action_indices)
+      input_state = torch.gather(onestep_beliefs, 0, belief_indices)
+      target_prediction = torch.gather(onestep_embed, 0, pred_indices)
+      # print("onestep")
+      # print(input_state.size(), action.size())
+      prediction = onestep_models[mdl](input_state, input_action)
+      # print(prediction)
+      prediction = prediction.mean
+      # print(prediction)
+      loss = ((prediction - target_prediction.detach()) ** 2).mean(axis=[0,1])
+      loss *= args.ensemble_loss_scale
+      # losses.append(loss)
+      disagreement_loss = loss.mean()
+      onestep_optimizer.zero_grad()
+      disagreement_loss.backward()
+      nn.utils.clip_grad_norm_(onestep_param_list, args.grad_clip_norm, norm_type=2)
+      onestep_optimizer.step()
+
+    #Plan2explore implementation: curious_actor model loss calculation and optimization
+    print("curious imagine run")
+    with torch.no_grad():
+      actor_states = posterior_states.detach()
+      actor_beliefs = beliefs.detach()
+    with FreezeParameters(model_modules):
+      curious_imagination_traj = imagine_ahead(actor_states, actor_beliefs, curious_actor_model, transition_model, args.planning_horizon)
+    curious_imged_beliefs, curious_imged_prior_states, curious_imged_prior_means, curious_imged_prior_std_devs, curious_imged_actions = curious_imagination_traj
+    # curious_feat, curious_states, curious_actions = self._curious_imagine_ahead(post) 
+    print("curious imagine run done")
+    curious_actor_loss = compute_curious_action_values(curious_imged_beliefs,
+                                                       curious_imged_prior_states,
+                                                       curious_imged_prior_means,
+                                                       curious_imged_prior_std_devs,
+                                                       curious_imged_actions)
+    curious_actor_loss = -tf.reduce_mean(curious_actor_loss)
+    print("curious_actor_loss", curious_actor_loss)
+
     #Dreamer implementation: actor loss calculation and optimization    
+    # if args.algo=="dreamer" or args.algo=="p2e":
     with torch.no_grad():
       actor_states = posterior_states.detach()
       actor_beliefs = beliefs.detach()
@@ -269,7 +363,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     # actions = actor_model.get_action(prev_belief,prev_state)
     # actor_loss = torch.mean(actions)
     #####################
-    imged_beliefs, imged_prior_states, imged_prior_means, imged_prior_std_devs = imagination_traj
+    imged_beliefs, imged_prior_states, imged_prior_means, imged_prior_std_devs, imged_actions = imagination_traj
     with FreezeParameters(model_modules + value_model.modules):
       imged_reward = bottle(reward_model, (imged_beliefs, imged_prior_states))
       value_pred = bottle(value_model, (imged_beliefs, imged_prior_states))
@@ -283,6 +377,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     actor_optimizer.step()
  
     #Dreamer implementation: value loss calculation and optimization
+    # if args.algo=="dreamer" or args.algo=="p2e":
     with torch.no_grad():
       value_beliefs = imged_beliefs.detach()
       value_prior_states = imged_prior_states.detach()
@@ -294,9 +389,16 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     value_loss.backward()
     nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip_norm, norm_type=2)
     value_optimizer.step()
-    
-    # # Store (0) observation loss (1) reward loss (2) KL loss (3) actor loss (4) value loss
-    losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item(), actor_loss.item(), value_loss.item()])
+  
+  # if args.algo=="planet":
+  #   # Store (0) observation loss (1) reward loss (2) KL loss
+  #   losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item()])
+  # if args.algo=="dreamer":
+  #   # Store (0) observation loss (1) reward loss (2) KL loss (3) actor loss (4) value loss
+  #   losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item(), actor_loss.item(), value_loss.item()])
+  # if args.algo=="p2e":
+  #   # Store (0) observation loss (1) reward loss (2) KL loss (3) actor loss (4) value loss (5) disagreement loss
+  losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item(), actor_loss.item(), value_loss.item(), disagreement_loss.item()])
 
 
   # Update and plot loss metrics
@@ -306,11 +408,13 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   metrics['kl_loss'].append(losses[2])
   metrics['actor_loss'].append(losses[3])
   metrics['value_loss'].append(losses[4])
+  metrics['disagreement_loss'].append(losses[5])
   lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['kl_loss']):], metrics['kl_loss'], 'kl_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['actor_loss']):], metrics['actor_loss'], 'actor_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['disagreement_loss']):], metrics['disagreement_loss'], 'disagreement_loss', results_dir)
 
 
   # Data collection
@@ -392,7 +496,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   writer.add_scalar("reward_loss", metrics['reward_loss'][0][-1], metrics['steps'][-1])
   writer.add_scalar("kl_loss", metrics['kl_loss'][0][-1], metrics['steps'][-1])
   writer.add_scalar("actor_loss", metrics['actor_loss'][0][-1], metrics['steps'][-1])
-  writer.add_scalar("value_loss", metrics['value_loss'][0][-1], metrics['steps'][-1])  
+  writer.add_scalar("value_loss", metrics['value_loss'][0][-1], metrics['steps'][-1])
+  writer.add_scalar("disagreement_loss", metrics['disagreement_loss'][0][-1], metrics['steps'][-1]) 
   print("episodes: {}, total_steps: {}, train_reward: {} ".format(metrics['episodes'][-1], metrics['steps'][-1], metrics['train_rewards'][-1]))
 
   # Checkpoint models

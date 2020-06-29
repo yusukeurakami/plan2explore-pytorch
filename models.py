@@ -88,25 +88,36 @@ class TransitionModel(jit.ScriptModule):
       hidden += [torch.stack(posterior_states[1:], dim=0), torch.stack(posterior_means[1:], dim=0), torch.stack(posterior_std_devs[1:], dim=0)]
     return hidden
 
-# class OneStepModel(jit.ScriptModule):
-#   def __init__(self, state_size, action_size, embedding_size, activateion_function='relu', model_width_factor=1):
-#     super().__init__()
-#     self.act_fn = getattr(F, activation_function)
-#     self.embedding_size = embedding_size
-#     self.hidden_size = embedding_size[0]*model_width_factor
-#     self.fc1 = nn.Linear(state_size + action_size, self.hidden_size)
-#     self.fc2 = nn.Linear(self.hidden_size + action_size, self.hidden_size)
-#     self.fc3 = nn.Linear(self.hidden_size + action_size, embedding_size)
-#     self.modules = [self.fc1, self.fc2, self.fc3]
+class OneStepModel(jit.ScriptModule):
+  def __init__(self, state_size, action_size, embedding_size, activation_function='relu', model_width_factor=1):
+    super().__init__()
+    self.act_fn = getattr(F, activation_function)
+    self.embedding_size = embedding_size
+    self.hidden_size = embedding_size*model_width_factor
+    self.fc1 = nn.Linear(state_size + action_size, self.hidden_size)
+    self.fc2 = nn.Linear(self.hidden_size + action_size, self.hidden_size)
+    self.fc3 = nn.Linear(self.hidden_size + action_size, embedding_size)
+    self.modules = [self.fc1, self.fc2, self.fc3]
 
-#   def __call__(self, prev_state, prev_action):
-#     prev_state = prev_state.detach()
-#     prev_action = prev_action.detach()
-#     hidden = self.act_fn(self.fc1(torch.cat([prev_state, prev_action], dim=1)))
-#     hidden = self.act_fn(self.fc2(hidden))
-#     mean = self.fc3(hidden)
-#     dist = torch.Deterministic(mean, torch.zeros_like(mean).to('cuda'))
-#     torch.distributions.Independent(dist, self.embedding_size)
+  def __call__(self, prev_state, prev_action):
+    prev_state = prev_state.detach()
+    prev_action = prev_action.detach() 
+    x = torch.cat([prev_state, prev_action], dim=-1) #torch.Size([49, 50, 30]) torch.Size([49, 50, 6])
+    # print("onestep input",x.size()) # onestep input torch.Size([49, 50, 36])
+    hidden = self.act_fn(self.fc1(x))
+    hidden = torch.cat([hidden, prev_action], dim=-1)
+    # print("onestep 2nd layer input", hidden.size()) # onestep 2nd layer input torch.Size([49, 50, 1030])
+    hidden = self.act_fn(self.fc2(hidden))
+    hidden = torch.cat([hidden, prev_action], dim=-1) 
+    # print("onestep 3rd layer input", hidden.size())
+    mean = self.fc3(hidden)
+    # print("onestep mean", mean.size())
+    # print(mean)
+    dist = Normal(mean, torch.zeros_like(mean).to('cuda'))
+    # print("onestep dist", [dist.batch_shape, dist.event_shape])
+    dist = torch.distributions.Independent(dist, 1)
+    # print("onestep dist independent", [dist.batch_shape, dist.event_shape])
+    return dist
 
 class SymbolicObservationModel(jit.ScriptModule):
   def __init__(self, observation_size, belief_size, state_size, embedding_size, activation_function='relu'):
@@ -235,7 +246,9 @@ class ActorModel(jit.ScriptModule):
     action_mean, action_std = self.forward(belief, state)
     dist = Normal(action_mean, action_std)
     dist = TransformedDistribution(dist, TanhBijector())
+    # print("actor model",dist)
     dist = torch.distributions.Independent(dist,1)
+    # print("actor model indendent",dist)
     dist = SampleDist(dist)
     # dist = TransformedDistribution(dist, TanhTransform())
     # dist = SampleDist(dist)
@@ -356,6 +369,10 @@ class SampleDist:
     logprob = dist.log_prob(sample)
     batch_size = sample.size(1)
     feature_size = sample.size(2)
+    # print("sample", sample.size())# torch.Size([100, 1, 6])
+    # print("argmax indices",torch.argmax(logprob, dim=0)) # torch.Size([1])
+    # print("reshape indices",torch.argmax(logprob, dim=0).reshape(1, batch_size, 1)) # torch.Size([1, 1, 1])
+    # print("expand indices",torch.argmax(logprob, dim=0).reshape(1, batch_size, 1).expand(1, batch_size, feature_size)) #torch.Size([1, 1, 6])
     indices = torch.argmax(logprob, dim=0).reshape(1, batch_size, 1).expand(1, batch_size, feature_size)
     return torch.gather(sample, 0, indices).squeeze(0)
 

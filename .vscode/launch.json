@@ -10,7 +10,9 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "args": ["--env", "walker-walk", "--id" "benchmark", "--action-repeat", "2", "--collect-interval", "2"],
+            "args": ["--env", "walker-walk", "--id" "benchmark",
+                 "--action-repeat", "2", "--collect-interval", "2",
+                 "--algo", "p2e", "--batch-size", "10", "--chunk-size", "10", "--onestep-num", "1", "--experience-size", "100000"],
         }
     ]
 }

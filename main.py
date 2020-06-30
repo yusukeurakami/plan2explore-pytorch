@@ -85,7 +85,7 @@ for k, v in vars(args).items():
 
 
 # Setup
-results_dir = os.path.join('results', '{}_{}'.format(args.env, args.id))
+results_dir = os.path.join('results-dev', '{}_{}'.format(args.env, args.id))
 os.makedirs(results_dir, exist_ok=True)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
@@ -128,9 +128,12 @@ transition_model = TransitionModel(args.belief_size, args.state_size, env.action
 observation_model = ObservationModel(args.symbolic_env, env.observation_size, args.belief_size, args.state_size, args.embedding_size, args.cnn_activation_function).to(device=args.device)
 reward_model = RewardModel(args.belief_size, args.state_size, args.hidden_size, args.dense_activation_function).to(device=args.device)
 encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.cnn_activation_function).to(device=args.device)
+param_list = list(transition_model.parameters()) + list(observation_model.parameters()) + list(reward_model.parameters()) + list(encoder.parameters())
 if args.algo=="dreamer" or args.algo=="p2e":
   actor_model = ActorModel(args.belief_size, args.state_size, args.hidden_size, env.action_size, args.dense_activation_function).to(device=args.device)
   value_model = ValueModel(args.belief_size, args.state_size, args.hidden_size, args.dense_activation_function).to(device=args.device)
+  value_actor_param_list = list(value_model.parameters()) + list(actor_model.parameters())
+  params_list = param_list + value_actor_param_list
 if args.algo=="p2e":
   curious_actor_model = ActorModel(args.belief_size, args.state_size, args.hidden_size, env.action_size, args.dense_activation_function).to(device=args.device)
   curious_value_model = ValueModel(args.belief_size, args.state_size, args.hidden_size, args.dense_activation_function).to(device=args.device)
@@ -139,9 +142,6 @@ if args.algo=="p2e":
   for x in onestep_models: onestep_param_list += list(x.parameters())
   onestep_modules = []
   for x in onestep_models: onestep_modules += x.modules
-param_list = list(transition_model.parameters()) + list(observation_model.parameters()) + list(reward_model.parameters()) + list(encoder.parameters())
-value_actor_param_list = list(value_model.parameters()) + list(actor_model.parameters())
-params_list = param_list + value_actor_param_list
 model_optimizer = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.model_learning_rate, eps=args.adam_epsilon)
 if args.algo=="dreamer" or args.algo=="p2e":
   actor_optimizer = optim.Adam(actor_model.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.actor_learning_rate, eps=args.adam_epsilon)
@@ -167,7 +167,7 @@ if args.models is not '' and os.path.exists(args.models):
 if args.algo=="dreamer":
   print("DREAMER")
   planner = actor_model
-if args.algo=="p2e":
+elif args.algo=="p2e":
   print("Plan2Explore") 
   planner = actor_model
   curious_planner = curious_actor_model
@@ -228,6 +228,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
 
   print("training loop")
   for s in tqdm(range(args.collect_interval)):
+    # print("optimize world model")
     # with FreezeParameters(actor_model.modules+value_model.modules):
     # print("collect interval", s)
     # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
@@ -296,6 +297,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
 
     if args.algo=="p2e":
       #Plan2explore implementation: onestep model loss calculation and optimization
+      # print("optimize onestep model")
       with torch.no_grad():
         onestep_actions = actions.detach()
         onestep_obs = observations.detach()
@@ -332,6 +334,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         onestep_optimizer.step()
       
       #Plan2explore implementation: actor model loss calculation and optimization
+      # print("optimize curious actor model")
       with torch.no_grad():
         curious_actor_states = posterior_states.detach()
         curious_actor_beliefs = beliefs.detach()
@@ -350,6 +353,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       curious_actor_optimizer.step()
 
       #Plan2explore implementation: curious_value model loss calculation and optimization
+      # print("optimize curious value model")
       with torch.no_grad():
         curious_value_beliefs = curious_imged_beliefs.detach()
         curious_value_prior_states = curious_imged_prior_states.detach()
@@ -367,12 +371,13 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       curious_actor_loss = torch.zeros(0).mean()
 
     if args.algo=="p2e" and not args.zero_shot and metrics['steps'][-1]*args.action_repeat < args.adaptation_step:
+      # print("not optimize the actor/value model")
       value_loss = torch.zeros(0).mean()
       actor_loss = torch.zeros(0).mean()
     else:
       if args.algo=="dreamer" or args.algo=="p2e":
         #Dreamer implementation: actor loss calculation and optimization    
-        # if metrics['steps'][-1]*args.action_repeat > args.adaptation_step:
+        # print("optimize actor model")
         with torch.no_grad():
           actor_states = posterior_states.detach()
           actor_beliefs = beliefs.detach()
@@ -392,7 +397,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         actor_optimizer.step()
     
         #Dreamer implementation: value loss calculation and optimization
-        # if args.algo=="dreamer" or args.algo=="p2e":
+        # print("optimize value model")
         with torch.no_grad():
           value_beliefs = imged_beliefs.detach()
           value_prior_states = imged_prior_states.detach()

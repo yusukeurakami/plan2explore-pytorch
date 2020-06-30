@@ -98,7 +98,7 @@ else:
   args.device = torch.device('cpu')
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 
            'observation_loss': [], 'reward_loss': [], 'kl_loss': [], 'actor_loss': [], 'value_loss': [], 
-           'disagreement_loss': [], 'curious_actor_loss':[], 'curious_value_loss':[]}
+           'onestep_loss': [], 'curious_actor_loss':[], 'curious_value_loss':[]}
 
 summary_name = results_dir + "/{}_{}_log"
 writer = SummaryWriter(summary_name.format(args.env, args.id))
@@ -245,11 +245,21 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     else:
       observation_dist = Normal(bottle(observation_model, (beliefs, posterior_states)), 1)
       observation_loss = -observation_dist.log_prob(observations[1:]).sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
-    if args.worldmodel_MSEloss:
-      reward_loss = F.mse_loss(bottle(reward_model, (beliefs, posterior_states)), rewards[:-1], reduction='none').mean(dim=(0,1))
-    else:
-      reward_dist = Normal(bottle(reward_model, (beliefs, posterior_states)),1)
+    if args.algo == "p2e":
+      if args.zero_shot:
+        reward_dist = Normal(bottle(reward_model, (beliefs.detach(), posterior_states)),1)
+      else:
+        if metrics['steps'][-1]*args.action_repeat > args.adaptation_step:
+          reward_dist = Normal(bottle(reward_model, (beliefs, posterior_states)),1)
+        else:
+          reward_dist = Normal(bottle(reward_model, (beliefs.detach(), posterior_states)),1)
       reward_loss = -reward_dist.log_prob(rewards[:-1]).mean(dim=(0, 1))
+    else:
+      if args.worldmodel_MSEloss:
+        reward_loss = F.mse_loss(bottle(reward_model, (beliefs, posterior_states)), rewards[:-1], reduction='none').mean(dim=(0,1))
+      else:
+        reward_dist = Normal(bottle(reward_model, (beliefs, posterior_states)),1)
+        reward_loss = -reward_dist.log_prob(rewards[:-1]).mean(dim=(0, 1))
     # transition loss
     div = kl_divergence(Normal(posterior_means, posterior_std_devs), Normal(prior_means, prior_std_devs)).sum(dim=2)
     kl_loss = torch.max(div, free_nats).mean(dim=(0, 1))  # Note that normalisation by overshooting distance and weighting by overshooting distance cancel out
@@ -284,122 +294,124 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
     model_optimizer.step()
 
-    #Dreamer implementation: actor loss calculation and optimization    
-    # if args.algo=="dreamer" or args.algo=="p2e":
-    with torch.no_grad():
-      actor_states = posterior_states.detach()
-      actor_beliefs = beliefs.detach()
-    with FreezeParameters(model_modules):
-      imagination_traj = imagine_ahead(actor_states, actor_beliefs, actor_model, transition_model, args.planning_horizon)
-    imged_beliefs, imged_prior_states, imged_prior_means, imged_prior_std_devs, imged_actions = imagination_traj
-    with FreezeParameters(model_modules + value_model.modules):
-      imged_reward = bottle(reward_model, (imged_beliefs, imged_prior_states))
-      value_pred = bottle(value_model, (imged_beliefs, imged_prior_states))
-    returns = lambda_return(imged_reward, value_pred, bootstrap=value_pred[-1], discount=args.discount, lambda_=args.disclam)
-    actor_loss = -torch.mean(returns)
-    # Update model parameters
-    actor_optimizer.zero_grad()
-    actor_loss.backward()
-    nn.utils.clip_grad_norm_(actor_model.parameters(), args.grad_clip_norm, norm_type=2)
-    # print( [module.weight.grad for module in  actor_model.modules])
-    actor_optimizer.step()
- 
-    #Dreamer implementation: value loss calculation and optimization
-    # if args.algo=="dreamer" or args.algo=="p2e":
-    with torch.no_grad():
-      value_beliefs = imged_beliefs.detach()
-      value_prior_states = imged_prior_states.detach()
-      target_return = returns.detach()
-    value_dist = Normal(bottle(value_model, (value_beliefs, value_prior_states)),1) # detach the input tensor from the transition network.
-    value_loss = -value_dist.log_prob(target_return).mean(dim=(0, 1)) 
-    # Update model parameters
-    value_optimizer.zero_grad()
-    value_loss.backward()
-    nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip_norm, norm_type=2)
-    value_optimizer.step()
+    if args.algo=="p2e":
+      #Plan2explore implementation: onestep model loss calculation and optimization
+      with torch.no_grad():
+        onestep_actions = actions.detach()
+        onestep_obs = observations.detach()
+        onestep_beliefs = beliefs.detach()
+      onestep_batch_size = onestep_actions.size(1)
+      action_feature_size = onestep_actions.size(2)
+      obs_feature_size = args.embedding_size
+      belief_feature_size = onestep_beliefs.size(2)
+      with FreezeParameters(model_modules):
+        onestep_embed = bottle(encoder, (onestep_obs, ))
+      bagging_size = args.batch_size
+      sample_with_replacement = torch.Tensor(args.onestep_num, bagging_size).uniform_(0,args.batch_size).type(torch.int64).to(device=args.device)
+      # losses = []
+      for mdl in range(len(onestep_models)):
+        action_indices = sample_with_replacement[mdl,:].reshape(onestep_batch_size, 1, 1).expand(onestep_batch_size, onestep_batch_size, action_feature_size)
+        pred_indices = sample_with_replacement[mdl,:].reshape(onestep_batch_size, 1, 1).expand(onestep_batch_size, onestep_batch_size, obs_feature_size)
+        belief_indices = sample_with_replacement[mdl,:].reshape(onestep_batch_size, 1, 1).expand(onestep_batch_size, onestep_batch_size, belief_feature_size)
+        input_action = torch.gather(onestep_actions, 0, action_indices)
+        input_state = torch.gather(onestep_beliefs, 0, belief_indices)
+        target_prediction = torch.gather(onestep_embed, 0, pred_indices)
+        # print("onestep")
+        # print(input_state.size(), action.size())
+        prediction = onestep_models[mdl](input_state, input_action)
+        # print(prediction)
+        prediction = prediction.mean
+        # print(prediction)
+        loss = ((prediction - target_prediction.detach()) ** 2).mean(axis=[0,1])
+        loss *= args.ensemble_loss_scale
+        # losses.append(loss)
+        onestep_loss = loss.mean()
+        onestep_optimizer.zero_grad()
+        onestep_loss.backward()
+        nn.utils.clip_grad_norm_(onestep_param_list, args.grad_clip_norm, norm_type=2)
+        onestep_optimizer.step()
+      
+      #Plan2explore implementation: actor model loss calculation and optimization
+      with torch.no_grad():
+        curious_actor_states = posterior_states.detach()
+        curious_actor_beliefs = beliefs.detach()
+      with FreezeParameters(model_modules):
+        curious_imagination_traj = imagine_ahead(curious_actor_states, curious_actor_beliefs, curious_actor_model, transition_model, args.planning_horizon)
+      curious_imged_beliefs, curious_imged_prior_states, curious_imged_prior_means, curious_imged_prior_std_devs, curious_imged_actions = curious_imagination_traj
+      with FreezeParameters(model_modules + value_model.modules + onestep_modules):
+        curious_reward = compute_intrinsic_reward(curious_imged_beliefs, curious_imged_actions, onestep_models)
+        curious_value_pred = bottle(value_model, (curious_imged_beliefs, curious_imged_prior_states))
+      curious_returns = lambda_return(curious_reward, curious_value_pred, bootstrap=curious_value_pred[-1], discount=args.discount, lambda_=args.disclam)
+      curious_actor_loss = -torch.mean(curious_returns)
+      # Update model parameters
+      curious_actor_optimizer.zero_grad()
+      curious_actor_loss.backward()
+      nn.utils.clip_grad_norm_(curious_actor_model.parameters(), args.grad_clip_norm, norm_type=2)
+      curious_actor_optimizer.step()
 
-    #Plan2explore implementation: onestep model loss calculation and optimization
-    # if args.algo=="p2e":
-    with torch.no_grad():
-      onestep_actions = actions.detach()
-      onestep_obs = observations.detach()
-      onestep_beliefs = beliefs.detach()
-    onestep_batch_size = onestep_actions.size(1)
-    action_feature_size = onestep_actions.size(2)
-    obs_feature_size = args.embedding_size
-    belief_feature_size = onestep_beliefs.size(2)
-    with FreezeParameters(model_modules):
-      onestep_embed = bottle(encoder, (onestep_obs, ))
-    bagging_size = args.batch_size
-    sample_with_replacement = torch.Tensor(args.onestep_num, bagging_size).uniform_(0,args.batch_size).type(torch.int64).to(device=args.device)
-    # losses = []
-    for mdl in range(len(onestep_models)):
-      action_indices = sample_with_replacement[mdl,:].reshape(onestep_batch_size, 1, 1).expand(onestep_batch_size, onestep_batch_size, action_feature_size)
-      pred_indices = sample_with_replacement[mdl,:].reshape(onestep_batch_size, 1, 1).expand(onestep_batch_size, onestep_batch_size, obs_feature_size)
-      belief_indices = sample_with_replacement[mdl,:].reshape(onestep_batch_size, 1, 1).expand(onestep_batch_size, onestep_batch_size, belief_feature_size)
-      input_action = torch.gather(onestep_actions, 0, action_indices)
-      input_state = torch.gather(onestep_beliefs, 0, belief_indices)
-      target_prediction = torch.gather(onestep_embed, 0, pred_indices)
-      # print("onestep")
-      # print(input_state.size(), action.size())
-      prediction = onestep_models[mdl](input_state, input_action)
-      # print(prediction)
-      prediction = prediction.mean
-      # print(prediction)
-      loss = ((prediction - target_prediction.detach()) ** 2).mean(axis=[0,1])
-      loss *= args.ensemble_loss_scale
-      # losses.append(loss)
-      disagreement_loss = loss.mean()
-      onestep_optimizer.zero_grad()
-      disagreement_loss.backward()
-      nn.utils.clip_grad_norm_(onestep_param_list, args.grad_clip_norm, norm_type=2)
-      onestep_optimizer.step()
+      #Plan2explore implementation: curious_value model loss calculation and optimization
+      with torch.no_grad():
+        curious_value_beliefs = curious_imged_beliefs.detach()
+        curious_value_prior_states = curious_imged_prior_states.detach()
+        curious_target_return = curious_returns.detach()
+      curious_value_dist = Normal(bottle(curious_value_model, (curious_value_beliefs, curious_value_prior_states)),1) # detach the input tensor from the transition network.
+      curious_value_loss = -curious_value_dist.log_prob(curious_target_return).mean(dim=(0, 1)) 
+      # Update model parameters
+      curious_value_optimizer.zero_grad()
+      curious_value_loss.backward()
+      nn.utils.clip_grad_norm_(curious_value_model.parameters(), args.grad_clip_norm, norm_type=2)
+      curious_value_optimizer.step()
+    else:
+      onestep_loss = torch.zeros(0).mean()
+      curious_value_loss = torch.zeros(0).mean()
+      curious_actor_loss = torch.zeros(0).mean()
 
-    #Plan2explore implementation: curious_actor model loss calculation and optimization
-    # if args.algo=="p2e":
-    with torch.no_grad():
-      actor_states = posterior_states.detach()
-      actor_beliefs = beliefs.detach()
-    with FreezeParameters(model_modules):
-      curious_imagination_traj = imagine_ahead(actor_states, actor_beliefs, curious_actor_model, transition_model, args.planning_horizon)
-    curious_imged_beliefs, curious_imged_prior_states, curious_imged_prior_means, curious_imged_prior_std_devs, curious_imged_actions = curious_imagination_traj
-    with FreezeParameters(model_modules + value_model.modules + onestep_modules):
-      curious_reward = compute_intrinsic_reward(curious_imged_beliefs, curious_imged_actions, onestep_models)
-      curious_value_pred = bottle(value_model, (curious_imged_beliefs, curious_imged_prior_states))
-    curious_returns = lambda_return(curious_reward, curious_value_pred, bootstrap=curious_value_pred[-1], discount=args.discount, lambda_=args.disclam)
-    curious_actor_loss = -torch.mean(curious_returns)
-    # Update model parameters
-    curious_actor_optimizer.zero_grad()
-    curious_actor_loss.backward()
-    nn.utils.clip_grad_norm_(curious_actor_model.parameters(), args.grad_clip_norm, norm_type=2)
-    curious_actor_optimizer.step()
-
-    #Plan2explore implementation: curious_value model loss calculation and optimization
-    # if args.algo=="p2e":
-    with torch.no_grad():
-      curious_value_beliefs = curious_imged_beliefs.detach()
-      curious_value_prior_states = curious_imged_prior_states.detach()
-      curious_target_return = curious_returns.detach()
-    curious_value_dist = Normal(bottle(curious_value_model, (curious_value_beliefs, curious_value_prior_states)),1) # detach the input tensor from the transition network.
-    curious_value_loss = -curious_value_dist.log_prob(curious_target_return).mean(dim=(0, 1)) 
-    # Update model parameters
-    curious_value_optimizer.zero_grad()
-    curious_value_loss.backward()
-    nn.utils.clip_grad_norm_(curious_value_model.parameters(), args.grad_clip_norm, norm_type=2)
-    curious_value_optimizer.step()
-
+    if args.algo=="p2e" and not args.zero_shot and metrics['steps'][-1]*args.action_repeat < args.adaptation_step:
+      value_loss = torch.zeros(0).mean()
+      actor_loss = torch.zeros(0).mean()
+    else:
+      if args.algo=="dreamer" or args.algo=="p2e":
+        #Dreamer implementation: actor loss calculation and optimization    
+        # if metrics['steps'][-1]*args.action_repeat > args.adaptation_step:
+        with torch.no_grad():
+          actor_states = posterior_states.detach()
+          actor_beliefs = beliefs.detach()
+        with FreezeParameters(model_modules):
+          imagination_traj = imagine_ahead(actor_states, actor_beliefs, actor_model, transition_model, args.planning_horizon)
+        imged_beliefs, imged_prior_states, imged_prior_means, imged_prior_std_devs, imged_actions = imagination_traj
+        with FreezeParameters(model_modules + value_model.modules):
+          imged_reward = bottle(reward_model, (imged_beliefs, imged_prior_states))
+          value_pred = bottle(value_model, (imged_beliefs, imged_prior_states))
+        returns = lambda_return(imged_reward, value_pred, bootstrap=value_pred[-1], discount=args.discount, lambda_=args.disclam)
+        actor_loss = -torch.mean(returns)
+        # Update model parameters
+        actor_optimizer.zero_grad()
+        actor_loss.backward()
+        nn.utils.clip_grad_norm_(actor_model.parameters(), args.grad_clip_norm, norm_type=2)
+        # print( [module.weight.grad for module in  actor_model.modules])
+        actor_optimizer.step()
+    
+        #Dreamer implementation: value loss calculation and optimization
+        # if args.algo=="dreamer" or args.algo=="p2e":
+        with torch.no_grad():
+          value_beliefs = imged_beliefs.detach()
+          value_prior_states = imged_prior_states.detach()
+          target_return = returns.detach()
+        value_dist = Normal(bottle(value_model, (value_beliefs, value_prior_states)),1) # detach the input tensor from the transition network.
+        value_loss = -value_dist.log_prob(target_return).mean(dim=(0, 1)) 
+        # Update model parameters
+        value_optimizer.zero_grad()
+        value_loss.backward()
+        nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip_norm, norm_type=2)
+        value_optimizer.step()
+      else:
+        value_loss = torch.zeros(0).mean()
+        actor_loss = torch.zeros(0).mean()
   
-  # if args.algo=="planet":
-  #   # Store (0) observation loss (1) reward loss (2) KL loss
-  #   losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item()])
-  # if args.algo=="dreamer":
-  #   # Store (0) observation loss (1) reward loss (2) KL loss (3) actor loss (4) value loss
-  #   losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item(), actor_loss.item(), value_loss.item()])
-  # if args.algo=="p2e":
   #   # Store (0) observation loss (1) reward loss (2) KL loss (3) actor loss (4) value loss 
             # (5) disagreement loss (6) curious_actor_loss (7) curious_value_loss
   losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item(), actor_loss.item(), value_loss.item(),
-                  disagreement_loss.item(), curious_actor_loss.item(), curious_value_loss.item()])
+                  onestep_loss.item(), curious_actor_loss.item(), curious_value_loss.item()])
 
 
   # Update and plot loss metrics
@@ -409,7 +421,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   metrics['kl_loss'].append(losses[2])
   metrics['actor_loss'].append(losses[3])
   metrics['value_loss'].append(losses[4])
-  metrics['disagreement_loss'].append(losses[5])
+  metrics['onestep_loss'].append(losses[5])
   metrics['curious_actor_loss'].append(losses[6])
   metrics['curious_value_loss'].append(losses[7])
   lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
@@ -417,25 +429,33 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   lineplot(metrics['episodes'][-len(metrics['kl_loss']):], metrics['kl_loss'], 'kl_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['actor_loss']):], metrics['actor_loss'], 'actor_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['disagreement_loss']):], metrics['disagreement_loss'], 'disagreement_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['onestep_loss']):], metrics['onestep_loss'], 'onestep_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['curious_actor_loss']):], metrics['curious_actor_loss'], 'curious_actor_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['curious_value_loss']):], metrics['curious_value_loss'], 'curious_value_loss', results_dir)
 
 
   # Data collection
   print("Data collection")
+  # PlaNet, Dreamer:       Uses the reward driven planner to collect the new data.
+  # Plan2Explore zeroshot: Uses the curiosity driven planner to collect the new data.
+  # Plan2Explore fewshot:  Uses the curiosity driven planner until it reaches to the adaptation_step. 
+  #                        After the adaptation_step, it uses the reward driven planner to collect the new data.
   if args.algo=="planet" or args.algo=="dreamer":
     policy = planner
-  elif args.algo=="p2e" and args.zero_shot:
-    # print("using curious_planner for data collection")
+  elif args.algo=="p2e":
     policy = curious_planner
-  elif args.algo=="p2e" and not args.zero_shot:
-    if metrics['steps'][-1]*args.action_repeat > args.adaptation_step:
-      # print("after adaptation. using planner for data collection")
+    if not args.zero_shot and (metrics['steps'][-1]*args.action_repeat > args.adaptation_step):
       policy = planner
-    else:
-      # print("before adaptation. using curious_planner for data collection")
-      policy = curious_planner
+  # elif args.algo=="p2e" and args.zero_shot:
+  #   # print("using curious_planner for data collection")
+  #   policy = curious_planner
+  # elif args.algo=="p2e" and not args.zero_shot:
+  #   if metrics['steps'][-1]*args.action_repeat > args.adaptation_step:
+  #     # print("after adaptation. using planner for data collection")
+  #     policy = planner
+  #   else:
+  #     # print("before adaptation. using curious_planner for data collection")
+  #     policy = curious_planner
   with torch.no_grad():
     observation, total_reward = env.reset(), 0
     belief, posterior_state, action = torch.zeros(1, args.belief_size, device=args.device), torch.zeros(1, args.state_size, device=args.device), torch.zeros(1, env.action_size, device=args.device)
@@ -462,18 +482,19 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   # Test model
   print("Test model")
   if episode % args.test_interval == 0:
-    if args.algo=="planet" or args.algo=="dreamer":
-      policy = planner
-    elif args.algo=="p2e" and args.zero_shot:
-      print("using planner for test")
-      policy = planner
-    elif args.algo=="p2e" and not args.zero_shot:
-      if metrics['steps'][-1]*args.action_repeat > args.adaptation_step:
-        print("after adaptation. using planner for test")
-        policy = planner
-      else:
-        print("before adaptation. using curious_planner for test")
-        policy = curious_planner
+    # PlaNet, Dreamer:       Uses the planner that is optimized along with the world model(World model trained with data from reward driven planner).
+    # Plan2Explore zeroshot: Uses the planner that is optimized along with the world model(World model trained with data from curiousity driven planner).
+    # Plan2Explore fewshot:  Uses the planner that will not be trained until reaches to adaptation_step. 
+    #                        After the adaptation_step it will be same as PlaNet or Dreamer
+    policy = planner
+    # if args.algo=="planet" or args.algo=="dreamer":
+    #   policy = planner
+    # elif args.algo=="p2e" and args.zero_shot:
+    #   print("using planner for test")
+    #   policy = planner
+    # elif args.algo=="p2e" and not args.zero_shot:
+    #   policy = planner
+
     # Set models to eval mode
     transition_model.eval()
     observation_model.eval()
@@ -528,7 +549,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   writer.add_scalar("kl_loss", metrics['kl_loss'][0][-1], metrics['steps'][-1])
   writer.add_scalar("actor_loss", metrics['actor_loss'][0][-1], metrics['steps'][-1])
   writer.add_scalar("value_loss", metrics['value_loss'][0][-1], metrics['steps'][-1])
-  writer.add_scalar("disagreement_loss", metrics['disagreement_loss'][0][-1], metrics['steps'][-1]) 
+  writer.add_scalar("onestep_loss", metrics['onestep_loss'][0][-1], metrics['steps'][-1]) 
   writer.add_scalar("curious_actor_loss", metrics['curious_actor_loss'][0][-1], metrics['steps'][-1]) 
   writer.add_scalar("curious_value_loss", metrics['curious_value_loss'][0][-1], metrics['steps'][-1]) 
   print("episodes: {}, total_steps: {}, train_reward: {} ".format(metrics['episodes'][-1], metrics['steps'][-1], metrics['train_rewards'][-1]))

@@ -18,7 +18,7 @@ from tensorboardX import SummaryWriter
 
 # Hyperparameters
 parser = argparse.ArgumentParser(description='PlaNet, Dreamer or plan2explore')
-parser.add_argument('--algo', type=str, default='p2e', help='planet, dreamer or p2e')
+parser.add_argument('--algo', type=str, default='p2e', help='planet, dreamer, multi-dreamer or p2e')
 parser.add_argument('--id', type=str, default='default', help='Experiment ID')
 parser.add_argument('--seed', type=int, default=1, metavar='S', help='Random seed')
 parser.add_argument('--disable-cuda', action='store_true', help='Disable CUDA')

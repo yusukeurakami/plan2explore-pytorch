@@ -54,7 +54,7 @@ parser.add_argument('--grad-clip-norm', type=float, default=100.0, metavar='C', 
 parser.add_argument('--test', action='store_true', help='Test only')
 parser.add_argument('--test-interval', type=int, default=10, metavar='I', help='Test interval (episodes)')
 parser.add_argument('--test-episodes', type=int, default=10, metavar='E', help='Number of test episodes')
-parser.add_argument('--checkpoint-interval', type=int, default=50, metavar='I', help='Checkpoint interval (episodes)')
+parser.add_argument('--checkpoint-interval', type=int, default=200, metavar='I', help='Checkpoint interval (episodes)')
 parser.add_argument('--checkpoint-experience', action='store_true', help='Checkpoint experience replay')
 parser.add_argument('--models', type=str, default='', metavar='M', help='Load model checkpoint')
 parser.add_argument('--experience-replay', type=str, default='', metavar='ER', help='Load experience replay')
@@ -85,7 +85,7 @@ for k, v in vars(args).items():
 
 
 # Setup
-results_dir = os.path.join('results', '{}_{}'.format(args.env, args.id))
+results_dir = os.path.join('results-dev', '{}_{}'.format(args.env, args.id))
 os.makedirs(results_dir, exist_ok=True)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
@@ -451,16 +451,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     policy = curious_planner
     if not args.zero_shot and (metrics['steps'][-1]*args.action_repeat > args.adaptation_step):
       policy = planner
-  # elif args.algo=="p2e" and args.zero_shot:
-  #   # print("using curious_planner for data collection")
-  #   policy = curious_planner
-  # elif args.algo=="p2e" and not args.zero_shot:
-  #   if metrics['steps'][-1]*args.action_repeat > args.adaptation_step:
-  #     # print("after adaptation. using planner for data collection")
-  #     policy = planner
-  #   else:
-  #     # print("before adaptation. using curious_planner for data collection")
-  #     policy = curious_planner
+
   with torch.no_grad():
     observation, total_reward = env.reset(), 0
     belief, posterior_state, action = torch.zeros(1, args.belief_size, device=args.device), torch.zeros(1, args.state_size, device=args.device), torch.zeros(1, env.action_size, device=args.device)
@@ -492,21 +483,18 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     # Plan2Explore fewshot:  Uses the planner that will not be trained until reaches to adaptation_step. 
     #                        After the adaptation_step it will be same as PlaNet or Dreamer
     policy = planner
-    # if args.algo=="planet" or args.algo=="dreamer":
-    #   policy = planner
-    # elif args.algo=="p2e" and args.zero_shot:
-    #   print("using planner for test")
-    #   policy = planner
-    # elif args.algo=="p2e" and not args.zero_shot:
-    #   policy = planner
 
     # Set models to eval mode
     transition_model.eval()
     observation_model.eval()
     reward_model.eval() 
     encoder.eval()
-    actor_model.eval()
-    value_model.eval()
+    if args.algo=="p2e" or args.algo=="dreamer":
+      actor_model.eval()
+      value_model.eval()
+      if args.algo=="p2e":
+        curious_actor_model.eval()
+        curious_value_model.eval()
     # Initialise parallelised test environments
     test_envs = EnvBatcher(Env, (args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth), {}, args.test_episodes)
     
@@ -542,8 +530,12 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     observation_model.train()
     reward_model.train()
     encoder.train()
-    actor_model.train()
-    value_model.train()
+    if args.algo=="p2e" or args.algo=="dreamer":
+      actor_model.train()
+      value_model.train()
+      if args.algo=="p2e":
+        curious_actor_model.train()
+        curious_value_model.train()
     # Close test environments
     test_envs.close()
 
@@ -561,18 +553,31 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
 
   # Checkpoint models
   if episode % args.checkpoint_interval == 0:
+    # print("checkpoint saving model")
     torch.save({'transition_model': transition_model.state_dict(),
-                'observation_model': observation_model.state_dict(),
-                'reward_model': reward_model.state_dict(),
-                'encoder': encoder.state_dict(),
-                'actor_model': actor_model.state_dict(),
-                'value_model': value_model.state_dict(),
-                'model_optimizer': model_optimizer.state_dict(),
-                'actor_optimizer': actor_optimizer.state_dict(),
-                'value_optimizer': value_optimizer.state_dict(),
-                'curious_actor_optimizer': curious_actor_optimizer.state_dict(),
-                'curious_value_optimizer': curious_value_optimizer.state_dict()
-                }, os.path.join(results_dir, 'models_%d.pth' % episode))
+            'observation_model': observation_model.state_dict(),
+            'reward_model': reward_model.state_dict(),
+            'encoder': encoder.state_dict(),
+            'model_optimizer': model_optimizer.state_dict(),
+            }, os.path.join(results_dir, 'models_%d.pth' % episode))
+    if args.algo=="p2e" or args.algo=="dreamer":
+      # print("checkpoint saving model")
+      torch.save({'actor_model': actor_model.state_dict(),
+                  'value_model': value_model.state_dict(),
+                  'actor_optimizer': actor_optimizer.state_dict(),
+                  'value_optimizer': value_optimizer.state_dict(),
+                  }, os.path.join(results_dir, 'actorvalue_models_%d.pth' % episode))
+    if args.algo=="p2e":
+      # print("checkpoint saving model")
+      torch.save({'curious_actor_model': actor_model.state_dict(),
+                  'curious_value_model': value_model.state_dict(),
+                  'curious_actor_optimizer': actor_optimizer.state_dict(),
+                  'curious_value_optimizer': value_optimizer.state_dict(),
+                  }, os.path.join(results_dir, 'curious_models_%d.pth' % episode))
+      onestep_model_dict = {'onestep_model{}'.format(i) : x.state_dict() for i,x in enumerate(onestep_models)}
+      onestep_model_dict['onestep_optimizer'] = onestep_optimizer.state_dict()
+      torch.save(onestep_model_dict, os.path.join(results_dir, 'onestep_models_%d.pth' % episode))
+
     if args.checkpoint_experience:
       torch.save(D, os.path.join(results_dir, 'experience.pth'))  # Warning: will fail with MemoryError with large memory sizes
 

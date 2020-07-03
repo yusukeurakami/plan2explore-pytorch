@@ -119,3 +119,6 @@ dmypy.json
 # Results
 results/
 MUJOCO_LOG.TXT
+test.py
+environment.yml
+.vscode/

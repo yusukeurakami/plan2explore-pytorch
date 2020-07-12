@@ -85,7 +85,7 @@ for k, v in vars(args).items():
 
 
 # Setup
-results_dir = os.path.join('results-dev', '{}_{}'.format(args.env, args.id))
+results_dir = os.path.join('results', '{}_{}'.format(args.env, args.id))
 os.makedirs(results_dir, exist_ok=True)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
@@ -520,14 +520,14 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
 
   writer.add_scalar("train_reward", metrics['train_rewards'][-1], metrics['steps'][-1])
   writer.add_scalar("train/episode_reward", metrics['train_rewards'][-1], metrics['steps'][-1]*args.action_repeat)
-  writer.add_scalar("observation_loss", metrics['observation_loss'][0][-1], metrics['steps'][-1])
-  writer.add_scalar("reward_loss", metrics['reward_loss'][0][-1], metrics['steps'][-1])
-  writer.add_scalar("kl_loss", metrics['kl_loss'][0][-1], metrics['steps'][-1])
-  writer.add_scalar("actor_loss", metrics['actor_loss'][0][-1], metrics['steps'][-1])
-  writer.add_scalar("value_loss", metrics['value_loss'][0][-1], metrics['steps'][-1])
-  writer.add_scalar("onestep_loss", metrics['onestep_loss'][0][-1], metrics['steps'][-1]) 
-  writer.add_scalar("curious_actor_loss", metrics['curious_actor_loss'][0][-1], metrics['steps'][-1]) 
-  writer.add_scalar("curious_value_loss", metrics['curious_value_loss'][0][-1], metrics['steps'][-1]) 
+  writer.add_scalar("observation_loss", metrics['observation_loss'][-1][0], metrics['steps'][-1])
+  writer.add_scalar("reward_loss", metrics['reward_loss'][-1][0], metrics['steps'][-1])
+  writer.add_scalar("kl_loss", metrics['kl_loss'][-1][0], metrics['steps'][-1])
+  writer.add_scalar("actor_loss", metrics['actor_loss'][-1][0], metrics['steps'][-1])
+  writer.add_scalar("value_loss", metrics['value_loss'][-1][0], metrics['steps'][-1])
+  writer.add_scalar("onestep_loss", metrics['onestep_loss'][-1][0], metrics['steps'][-1]) 
+  writer.add_scalar("curious_actor_loss", metrics['curious_actor_loss'][-1][0], metrics['steps'][-1]) 
+  writer.add_scalar("curious_value_loss", metrics['curious_value_loss'][-1][0], metrics['steps'][-1]) 
   print("episodes: {}, total_steps: {}, train_reward: {} ".format(metrics['episodes'][-1], metrics['steps'][-1], metrics['train_rewards'][-1]))
 
   # Checkpoint models

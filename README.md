@@ -13,9 +13,9 @@ To install all dependencies with Anaconda run using the following commands.
 
 `source activate p2e` 
 
-## Training (e.g. DMC walker-walk)
+## Training (e.g. DMC walker-walk zero-shot)
 ```bash
-python main.py --algo p2e --env walker-walk --action-repeat 2 --id name-of-experiement
+python main.py --algo p2e --env walker-walk --action-repeat 2 --id name-of-experiement --zero-shot
 ```
 
 For best performance with DeepMind Control Suite, try setting environment variable `MUJOCO_GL=egl` (see instructions and details [here](https://github.com/deepmind/dm_control#rendering)).
